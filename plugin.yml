@@ -1,0 +1,17 @@
+name: CoinCard
+version: 1.0.0
+main: com.foxsrv.coincard.CoinCardPlugin
+api-version: '1.21'
+author: FoxSrv
+depend: [Vault]
+commands:
+  coin:
+    description: CoinCard main command
+    usage: /coin <id|card|pay|buy|sell|reload|server>
+    aliases: [coincard]
+    permission: coin.user
+permissions:
+  coin.user:
+    default: true
+  coin.admin:
+    default: op

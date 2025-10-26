@@ -1,0 +1,10 @@
+Server: "5e8127e5-646b-36d6-9ff7-ace1050597d8"     # Server Vault Account UUID
+ServerID: "829198573318747000"                     # Server Coin Account ID
+Card: "e1301fadfc35"                               # Server Card ID
+Buy: 7200.0000                                     # Vault recebido por 1.00000000 coin (coins->vault)
+Sell: 0.00010500                                   # Coins recebidos por 1.0000 vault (vault->coins)
+API: "http://coin.foxsrv.net:26450/"
+# Geral
+QueueIntervalTicks: 20       # processar 1 tarefa / 20 ticks (~1s)
+PerUserCooldownMs: 1000      # cooldown de /coin pay, /coin buy, /coin sell
+TimeoutMs: 10000             # timeout HTTP
