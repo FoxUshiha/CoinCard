@@ -3,6 +3,10 @@ package com.foxsrv.coincard;
 import org.bukkit.Bukkit;
 import org.bukkit.ChatColor;
 import org.bukkit.OfflinePlayer;
+import org.bukkit.command.Command;
+import org.bukkit.command.CommandExecutor;
+import org.bukkit.command.CommandSender;
+import org.bukkit.command.TabCompleter;
 import org.bukkit.entity.Player;
 import org.bukkit.plugin.RegisteredServiceProvider;
 import org.bukkit.plugin.ServicePriority;
@@ -14,6 +18,12 @@ import net.milkbowl.vault.economy.Economy;
 
 import me.clip.placeholderapi.expansion.PlaceholderExpansion;
 
+import javax.crypto.Cipher;
+import javax.crypto.SecretKey;
+import javax.crypto.SecretKeyFactory;
+import javax.crypto.spec.IvParameterSpec;
+import javax.crypto.spec.PBEKeySpec;
+import javax.crypto.spec.SecretKeySpec;
 import java.io.*;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
@@ -21,9 +31,12 @@ import java.net.HttpURLConnection;
 import java.net.URI;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.security.SecureRandom;
+import java.security.spec.KeySpec;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
 
@@ -46,6 +59,17 @@ public class CoinCardPlugin extends JavaPlugin {
     
     // Command reference
     private CoinCommand coinCommand;
+    private PayCommand payCommand;
+    private BalanceCommand balanceCommand;
+    private BalTopCommand balTopCommand;
+    
+    // Encryption
+    private static final String ENCRYPTION_SALT = "CoinCardSalt2024!";
+    private static final String ENCRYPTION_PASSWORD = "CoinCardSecretKey2024";
+    private static final int ENCRYPTION_ITERATIONS = 65536;
+    private static final int ENCRYPTION_KEY_LENGTH = 256;
+    private SecretKey encryptionKey;
+    private byte[] encryptionIv;
     
     public static CoinCardPlugin get() { return instance; }
     public static CoinCardAPI getAPI() { return api; }
@@ -54,9 +78,23 @@ public class CoinCardPlugin extends JavaPlugin {
     public void onEnable() {
         instance = this;
         
+        // Initialize encryption
+        initEncryption();
+        
         // Save default configs
         saveDefaultConfig();
-        saveResource("users.yml", false);
+        
+        // Criar arquivo users.dat se não existir
+        File usersFile = new File(getDataFolder(), "users.dat");
+        if (!usersFile.exists()) {
+            try {
+                usersFile.createNewFile();
+                getLogger().info("Created new users.dat file.");
+            } catch (IOException e) {
+                getLogger().warning("Could not create users.dat: " + e.getMessage());
+            }
+        }
+        
         reloadLocalConfig();
         
         // Check dependencies
@@ -73,6 +111,7 @@ public class CoinCardPlugin extends JavaPlugin {
         // Initialize components
         users = new UserStore(this);
         users.load();
+        users.migrateFromYaml(); // Migrar dados do YAML antigo se existir
         
         apiClient = new ApiClient(config.getApiBase(), config.getTimeoutMs(), getLogger());
         queue = new QueueService(this, config.getQueueIntervalTicks());
@@ -84,10 +123,24 @@ public class CoinCardPlugin extends JavaPlugin {
         // Register as a service for other plugins
         getServer().getServicesManager().register(CoinCardAPI.class, api, this, ServicePriority.Normal);
         
-        // Register command
+        // Register commands
         coinCommand = new CoinCommand(this, users, apiClient, queue, cooldowns, economy, config);
+        payCommand = new PayCommand(this, users, apiClient, queue, cooldowns, config);
+        balanceCommand = new BalanceCommand(this, users, apiClient);
+        balTopCommand = new BalTopCommand(this, users, apiClient);
+        
+        // Registro de todos os comandos e aliases
         Objects.requireNonNull(getCommand("coin")).setExecutor(coinCommand);
         Objects.requireNonNull(getCommand("coin")).setTabCompleter(coinCommand);
+        Objects.requireNonNull(getCommand("c")).setExecutor(coinCommand);
+        Objects.requireNonNull(getCommand("c")).setTabCompleter(coinCommand);
+        
+        Objects.requireNonNull(getCommand("pay")).setExecutor(payCommand);
+        
+        Objects.requireNonNull(getCommand("balance")).setExecutor(balanceCommand);
+        Objects.requireNonNull(getCommand("bal")).setExecutor(balanceCommand);
+        
+        Objects.requireNonNull(getCommand("baltop")).setExecutor(balTopCommand);
         
         // Register placeholder if PlaceholderAPI is available
         if (Bukkit.getPluginManager().getPlugin("PlaceholderAPI") != null) {
@@ -97,6 +150,7 @@ public class CoinCardPlugin extends JavaPlugin {
         }
         
         getLogger().info("CoinCard v" + getDescription().getVersion() + " enabled.");
+        getLogger().info("Commands: /coin, /c, /pay, /balance, /bal, /baltop");
     }
     
     @Override
@@ -108,6 +162,48 @@ public class CoinCardPlugin extends JavaPlugin {
             ((CoinCardAPIImpl) api).shutdown();
         }
         getLogger().info("CoinCard disabled.");
+    }
+    
+    private void initEncryption() {
+        try {
+            // Generate random IV
+            SecureRandom random = new SecureRandom();
+            encryptionIv = new byte[16];
+            random.nextBytes(encryptionIv);
+            
+            // Generate key from password
+            SecretKeyFactory factory = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256");
+            KeySpec spec = new PBEKeySpec(ENCRYPTION_PASSWORD.toCharArray(), 
+                    ENCRYPTION_SALT.getBytes(), ENCRYPTION_ITERATIONS, ENCRYPTION_KEY_LENGTH);
+            SecretKey tmp = factory.generateSecret(spec);
+            encryptionKey = new SecretKeySpec(tmp.getEncoded(), "AES");
+        } catch (Exception e) {
+            getLogger().severe("Failed to initialize encryption: " + e.getMessage());
+        }
+    }
+    
+    public byte[] encrypt(byte[] data) {
+        try {
+            Cipher cipher = Cipher.getInstance("AES/CBC/PKCS5Padding");
+            IvParameterSpec ivSpec = new IvParameterSpec(encryptionIv);
+            cipher.init(Cipher.ENCRYPT_MODE, encryptionKey, ivSpec);
+            return cipher.doFinal(data);
+        } catch (Exception e) {
+            getLogger().severe("Encryption error: " + e.getMessage());
+            return data;
+        }
+    }
+    
+    public byte[] decrypt(byte[] data) {
+        try {
+            Cipher cipher = Cipher.getInstance("AES/CBC/PKCS5Padding");
+            IvParameterSpec ivSpec = new IvParameterSpec(encryptionIv);
+            cipher.init(Cipher.DECRYPT_MODE, encryptionKey, ivSpec);
+            return cipher.doFinal(data);
+        } catch (Exception e) {
+            getLogger().severe("Decryption error: " + e.getMessage());
+            return data;
+        }
     }
     
     public void reloadLocalConfig() {
@@ -130,6 +226,23 @@ public class CoinCardPlugin extends JavaPlugin {
             coinCommand.setApi(apiClient);
             coinCommand.setQueue(queue);
             coinCommand.setCooldowns(cooldowns);
+        }
+        
+        if (payCommand != null) {
+            payCommand.setConfig(config);
+            payCommand.setApi(apiClient);
+            payCommand.setQueue(queue);
+            payCommand.setCooldowns(cooldowns);
+        }
+        
+        if (balanceCommand != null) {
+            balanceCommand.setApi(apiClient);
+            balanceCommand.setUsers(users);
+        }
+        
+        if (balTopCommand != null) {
+            balTopCommand.setApi(apiClient);
+            balTopCommand.setUsers(users);
         }
         
         if (placeholderExpansion != null) {
@@ -592,68 +705,198 @@ public class CoinCardPlugin extends JavaPlugin {
     }
     
     /**
-     * UserStore - Manages user data (UUID -> Card)
+     * UserStore - Manages user data (UUID -> Card) with encryption
      */
     public static class UserStore {
-        private final JavaPlugin plugin;
+        private final CoinCardPlugin plugin;
         private final File file;
-        private final YamlConfiguration yaml = new YamlConfiguration();
+        private final Map<UUID, UserData> data = new ConcurrentHashMap<>();
+        private boolean dirty = false;
     
-        public UserStore(JavaPlugin plugin) {
+        public UserStore(CoinCardPlugin plugin) {
             this.plugin = plugin;
-            this.file = new File(plugin.getDataFolder(), "users.yml");
+            this.file = new File(plugin.getDataFolder(), "users.dat");
+        }
+        
+        private static class UserData implements Serializable {
+            private static final long serialVersionUID = 1L;
+            String nick;
+            String card;
+            
+            UserData(String nick, String card) {
+                this.nick = nick;
+                this.card = card;
+            }
         }
     
+        @SuppressWarnings("unchecked")
         public void load() {
-            if (!file.exists()) plugin.saveResource("users.yml", false);
+            if (!file.exists()) {
+                return;
+            }
+            
+            if (file.length() == 0) {
+                plugin.getLogger().info("users.dat is empty, starting fresh.");
+                return;
+            }
+            
+            try (FileInputStream fis = new FileInputStream(file);
+                 ObjectInputStream ois = new ObjectInputStream(fis)) {
+                
+                // Read encrypted data
+                int length = ois.readInt();
+                byte[] encryptedData = new byte[length];
+                ois.readFully(encryptedData);
+                
+                // Decrypt
+                byte[] decryptedData = plugin.decrypt(encryptedData);
+                
+                // Deserialize
+                try (ByteArrayInputStream bais = new ByteArrayInputStream(decryptedData);
+                     ObjectInputStream dataOis = new ObjectInputStream(bais)) {
+                    
+                    Map<UUID, UserData> loaded = (Map<UUID, UserData>) dataOis.readObject();
+                    data.clear();
+                    data.putAll(loaded);
+                }
+                
+                plugin.getLogger().info("Loaded " + data.size() + " users from encrypted database.");
+                
+            } catch (EOFException e) {
+                plugin.getLogger().warning("users.dat is corrupted or empty, starting fresh.");
+                data.clear();
+            } catch (Exception e) {
+                plugin.getLogger().severe("Failed to load users.dat: " + e.getMessage());
+                data.clear();
+            }
+        }
+        
+        public void migrateFromYaml() {
+            File yamlFile = new File(plugin.getDataFolder(), "users.yml");
+            if (!yamlFile.exists()) {
+                return;
+            }
+            
             try {
-                yaml.load(file);
-            } catch (IOException | InvalidConfigurationException e) {
-                plugin.getLogger().severe("Failed to load users.yml: " + e.getMessage());
+                YamlConfiguration yaml = new YamlConfiguration();
+                yaml.load(yamlFile);
+                
+                int migrated = 0;
+                if (yaml.isConfigurationSection("Users")) {
+                    for (String key : yaml.getConfigurationSection("Users").getKeys(false)) {
+                        try {
+                            UUID uuid = UUID.fromString(key);
+                            String nick = yaml.getString("Users." + key + ".nick");
+                            String card = yaml.getString("Users." + key + ".Card");
+                            if (nick != null && card != null && !data.containsKey(uuid)) {
+                                data.put(uuid, new UserData(nick, card));
+                                migrated++;
+                                dirty = true;
+                            }
+                        } catch (Exception ignored) {}
+                    }
+                }
+                
+                if (migrated > 0) {
+                    plugin.getLogger().info("Migrated " + migrated + " users from users.yml to encrypted format.");
+                    save();
+                    
+                    // Renomear o arquivo antigo como backup
+                    File backupFile = new File(plugin.getDataFolder(), "users.yml.bak");
+                    if (yamlFile.renameTo(backupFile)) {
+                        plugin.getLogger().info("Renamed old users.yml to users.yml.bak");
+                    } else {
+                        plugin.getLogger().warning("Could not rename users.yml, you may delete it manually.");
+                    }
+                }
+                
+            } catch (Exception e) {
+                plugin.getLogger().warning("Failed to migrate from users.yml: " + e.getMessage());
             }
         }
     
         public void save() {
-            try { yaml.save(file); } catch (IOException e) {
-                plugin.getLogger().severe("Failed to save users.yml: " + e.getMessage());
+            if (!dirty) return;
+            
+            try {
+                if (!plugin.getDataFolder().exists()) {
+                    plugin.getDataFolder().mkdirs();
+                }
+                
+                // Serialize data
+                ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                try (ObjectOutputStream oos = new ObjectOutputStream(baos)) {
+                    oos.writeObject(new HashMap<>(data));
+                }
+                byte[] serializedData = baos.toByteArray();
+                
+                // Encrypt
+                byte[] encryptedData = plugin.encrypt(serializedData);
+                
+                // Write to file
+                try (FileOutputStream fos = new FileOutputStream(file);
+                     ObjectOutputStream oos = new ObjectOutputStream(fos)) {
+                    
+                    oos.writeInt(encryptedData.length);
+                    oos.write(encryptedData);
+                }
+                
+                dirty = false;
+                
+            } catch (Exception e) {
+                plugin.getLogger().severe("Failed to save users.dat: " + e.getMessage());
             }
         }
     
-        private String basePath(UUID uuid) { return "Users." + uuid.toString(); }
-    
         public void setNick(UUID uuid, String nick) {
-            yaml.set(basePath(uuid) + ".nick", nick);
-            save();
+            UserData ud = data.computeIfAbsent(uuid, k -> new UserData(nick, null));
+            if (!nick.equals(ud.nick)) {
+                ud.nick = nick;
+                dirty = true;
+            }
         }
     
         public void setCard(UUID uuid, String card) {
-            yaml.set(basePath(uuid) + ".Card", card);
+            UserData ud = data.computeIfAbsent(uuid, k -> new UserData(null, card));
+            if (!card.equals(ud.card)) {
+                ud.card = card;
+                dirty = true;
+            }
+            // Auto-save after setting card (important data)
             save();
         }
     
-        public String getNick(UUID uuid) { return yaml.getString(basePath(uuid) + ".nick", null); }
-        public String getCard(UUID uuid) { return yaml.getString(basePath(uuid) + ".Card", null); }
+        public String getNick(UUID uuid) { 
+            UserData ud = data.get(uuid);
+            return ud != null ? ud.nick : null;
+        }
+        
+        public String getCard(UUID uuid) { 
+            UserData ud = data.get(uuid);
+            return ud != null ? ud.card : null;
+        }
+        
+        public Set<UUID> getAllUsers() {
+            return Collections.unmodifiableSet(data.keySet());
+        }
     
         public UUID findUUIDByNick(String nick) {
             if (nick == null || nick.isEmpty()) return null;
-            if (!yaml.isConfigurationSection("Users")) return null;
             
-            for (String key : yaml.getConfigurationSection("Users").getKeys(false)) {
-                String n = yaml.getString("Users." + key + ".nick", "");
-                if (nick.equalsIgnoreCase(n)) {
-                    try { 
-                        return UUID.fromString(key); 
-                    } catch (Exception ignored) {}
+            for (Map.Entry<UUID, UserData> entry : data.entrySet()) {
+                if (nick.equalsIgnoreCase(entry.getValue().nick)) {
+                    return entry.getKey();
                 }
             }
             return null;
         }
         
         public String getCardByNick(String nick) {
-            UUID u = findUUIDByNick(nick);
-            if (u == null) return null;
-            return getCard(u);
+            UUID uuid = findUUIDByNick(nick);
+            return uuid != null ? getCard(uuid) : null;
         }
+        
+        public int size() { return data.size(); }
     }
     
     /**
@@ -716,6 +959,11 @@ public class CoinCardPlugin extends JavaPlugin {
             BigDecimal bd = BigDecimal.valueOf(value).stripTrailingZeros();
             return bd.toPlainString();
         }
+        
+        public static String formatFull(BigDecimal value) {
+            if (value == null || value.compareTo(BigDecimal.ZERO) == 0) return "0";
+            return value.stripTrailingZeros().toPlainString();
+        }
     }
     
     /**
@@ -746,6 +994,13 @@ public class CoinCardPlugin extends JavaPlugin {
                 this.coins = coins;
                 this.error = error;
             }
+        }
+        
+        /**
+         * Callback interface for CardInfoResult
+         */
+        public interface CardInfoResultCallback {
+            void onResult(CardInfoResult result);
         }
     
         public ApiClient(String baseUrl, int timeoutMs, Logger logger) {
@@ -784,6 +1039,15 @@ public class CoinCardPlugin extends JavaPlugin {
                 log.warning("HTTP error getting card info: " + e.getMessage());
                 return new CardInfoResult(false, null, "HTTP_ERROR");
             }
+        }
+        
+        public void getCardInfo(String cardCode, CardInfoResultCallback callback) {
+            Bukkit.getScheduler().runTaskAsynchronously(CoinCardPlugin.get(), () -> {
+                CardInfoResult result = getCardInfo(cardCode);
+                Bukkit.getScheduler().runTask(CoinCardPlugin.get(), () -> {
+                    callback.onResult(result);
+                });
+            });
         }
     
         private String postJson(String urlStr, String json) throws IOException {
@@ -946,9 +1210,425 @@ public class CoinCardPlugin extends JavaPlugin {
     }
     
     /**
+     * PayCommand - /pay command
+     */
+    public static class PayCommand implements CommandExecutor {
+        private final CoinCardPlugin plugin;
+        private final UserStore users;
+        private ApiClient api;
+        private QueueService queue;
+        private CooldownManager cooldowns;
+        private ConfigManager cfg;
+        
+        private static final String YELLOW = ChatColor.YELLOW.toString();
+        private static final String GREEN = ChatColor.GREEN.toString();
+        private static final String RED = ChatColor.RED.toString();
+        private static final String AQUA = ChatColor.AQUA.toString();
+        
+        public PayCommand(CoinCardPlugin plugin, UserStore users, ApiClient api,
+                         QueueService queue, CooldownManager cooldowns, ConfigManager cfg) {
+            this.plugin = plugin;
+            this.users = users;
+            this.api = api;
+            this.queue = queue;
+            this.cooldowns = cooldowns;
+            this.cfg = cfg;
+        }
+        
+        public void setApi(ApiClient api) { this.api = api; }
+        public void setQueue(QueueService queue) { this.queue = queue; }
+        public void setCooldowns(CooldownManager cooldowns) { this.cooldowns = cooldowns; }
+        public void setConfig(ConfigManager cfg) { this.cfg = cfg; }
+        
+        private String getCardByNick(String nick) {
+            Player onlinePlayer = Bukkit.getPlayerExact(nick);
+            if (onlinePlayer != null) {
+                String card = users.getCard(onlinePlayer.getUniqueId());
+                if (card != null) return card;
+            }
+            
+            UUID uuid = users.findUUIDByNick(nick);
+            if (uuid != null) {
+                return users.getCard(uuid);
+            }
+            
+            return null;
+        }
+        
+        @Override
+        public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
+            if (!(sender instanceof Player)) {
+                sender.sendMessage(RED + "Players only.");
+                return true;
+            }
+            
+            if (args.length < 2) {
+                sender.sendMessage(RED + "Usage: /pay <player> <amount>");
+                return true;
+            }
+            
+            Player p = (Player) sender;
+            
+            if (!cooldowns.checkAndStamp(p.getUniqueId())) {
+                p.sendMessage(RED + "Please wait 1 second before next transaction.");
+                return true;
+            }
+            
+            String fromCard = users.getCard(p.getUniqueId());
+            if (fromCard == null || fromCard.isEmpty()) {
+                p.sendMessage(RED + "Set your Card first with /coin card <card>.");
+                return true;
+            }
+            
+            String toCard = getCardByNick(args[0]);
+            if (toCard == null) {
+                p.sendMessage(RED + "Target player doesn't have a card set or doesn't exist.");
+                return true;
+            }
+            
+            double parsed;
+            try {
+                parsed = Double.parseDouble(args[1]);
+            } catch (Exception e) {
+                p.sendMessage(RED + "Invalid amount.");
+                return true;
+            }
+            
+            final double fAmount = DecimalUtil.truncate(Math.max(0.0, parsed), 8);
+            if (fAmount <= 0) {
+                p.sendMessage(RED + "Invalid amount.");
+                return true;
+            }
+            
+            final String fFromCard = fromCard;
+            final String fToCard = toCard;
+            final String fTargetName = args[0];
+            
+            Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
+                ApiClient.CardTransferResult r = api.transferByCard(fFromCard, fToCard, fAmount);
+                
+                Bukkit.getScheduler().runTask(plugin, () -> {
+                    if (r.success) {
+                        p.sendMessage(GREEN + "You sent " + YELLOW + DecimalUtil.formatFull(fAmount) +
+                                GREEN + " to " + YELLOW + fTargetName + GREEN +
+                                ". Transaction: " + AQUA + (r.txId != null ? r.txId : "-"));
+                        
+                        Player onlineTarget = Bukkit.getPlayerExact(fTargetName);
+                        if (onlineTarget != null && onlineTarget.isOnline()) {
+                            onlineTarget.sendMessage(GREEN + "You received " + YELLOW + DecimalUtil.formatFull(fAmount) +
+                                    GREEN + " coins from " + YELLOW + p.getName() +
+                                    GREEN + ". Transaction: " + AQUA + (r.txId != null ? r.txId : "-"));
+                        }
+                        
+                        plugin.getLogger().info(p.getName() + " sent " + fAmount + " to " + fTargetName +
+                                " (offline=" + (onlineTarget == null) + ") tx=" + r.txId);
+                    } else {
+                        p.sendMessage(RED + "Transaction failed. Invalid card or insufficient funds.");
+                    }
+                });
+            });
+            
+            return true;
+        }
+    }
+    
+    /**
+     * BalanceCommand - /balance and /bal commands
+     */
+    public static class BalanceCommand implements CommandExecutor {
+        private final CoinCardPlugin plugin;
+        private UserStore users;
+        private ApiClient api;
+        
+        private static final String YELLOW = ChatColor.YELLOW.toString();
+        private static final String GREEN = ChatColor.GREEN.toString();
+        private static final String RED = ChatColor.RED.toString();
+        
+        public BalanceCommand(CoinCardPlugin plugin, UserStore users, ApiClient api) {
+            this.plugin = plugin;
+            this.users = users;
+            this.api = api;
+        }
+        
+        public void setUsers(UserStore users) { this.users = users; }
+        public void setApi(ApiClient api) { this.api = api; }
+        
+        @Override
+        public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
+            if (args.length == 0) {
+                // Check own balance
+                if (!(sender instanceof Player)) {
+                    sender.sendMessage(RED + "Please specify a player from console: /balance <player>");
+                    return true;
+                }
+                
+                Player p = (Player) sender;
+                checkBalance(p, p.getUniqueId(), p.getName());
+                
+            } else {
+                // Check another player's balance
+                if (!sender.hasPermission("coin.admin")) {
+                    sender.sendMessage(RED + "You don't have permission to check other players!");
+                    return true;
+                }
+                
+                String targetName = args[0];
+                Player onlineTarget = Bukkit.getPlayerExact(targetName);
+                
+                if (onlineTarget != null) {
+                    checkBalance(sender, onlineTarget.getUniqueId(), onlineTarget.getName());
+                } else {
+                    UUID uuid = users.findUUIDByNick(targetName);
+                    if (uuid == null) {
+                        sender.sendMessage(RED + "Player not found or has no card set.");
+                    } else {
+                        checkBalance(sender, uuid, targetName);
+                    }
+                }
+            }
+            
+            return true;
+        }
+        
+        private void checkBalance(CommandSender sender, UUID uuid, String name) {
+            String card = users.getCard(uuid);
+            if (card == null || card.isEmpty()) {
+                sender.sendMessage(RED + name + " doesn't have a card set.");
+                return;
+            }
+            
+            Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
+                ApiClient.CardInfoResult result = api.getCardInfo(card);
+                
+                Bukkit.getScheduler().runTask(plugin, () -> {
+                    if (result.success && result.coins != null) {
+                        sender.sendMessage(GREEN + name + "'s balance: " + YELLOW + 
+                                DecimalUtil.formatFull(result.coins));
+                    } else {
+                        sender.sendMessage(RED + "Failed to check balance: " + 
+                                (result.error != null ? result.error : "Unknown error"));
+                    }
+                });
+            });
+        }
+    }
+    
+    /**
+     * BalTopCommand - /baltop command
+     */
+    public static class BalTopCommand implements CommandExecutor {
+        private final CoinCardPlugin plugin;
+        private UserStore users;
+        private ApiClient api;
+        private final Map<Integer, List<BalanceEntry>> pageCache = new ConcurrentHashMap<>();
+        private BigDecimal totalServerBalance = BigDecimal.ZERO;
+        private int totalPlayers = 0;
+        private long lastCacheUpdate = 0;
+        private boolean isUpdating = false;
+        
+        private static final String YELLOW = ChatColor.YELLOW.toString();
+        private static final String GOLD = ChatColor.GOLD.toString();
+        private static final String GREEN = ChatColor.GREEN.toString();
+        private static final String GRAY = ChatColor.GRAY.toString();
+        private static final String WHITE = ChatColor.WHITE.toString();
+        private static final String RED = ChatColor.RED.toString();
+        private static final String AQUA = ChatColor.AQUA.toString();
+        
+        private static class BalanceEntry implements Comparable<BalanceEntry> {
+            final String name;
+            final BigDecimal balance;
+            final String card;
+            
+            BalanceEntry(String name, BigDecimal balance, String card) {
+                this.name = name;
+                this.balance = balance;
+                this.card = card;
+            }
+            
+            @Override
+            public int compareTo(BalanceEntry o) {
+                return o.balance.compareTo(this.balance); // Descending order
+            }
+        }
+        
+        public BalTopCommand(CoinCardPlugin plugin, UserStore users, ApiClient api) {
+            this.plugin = plugin;
+            this.users = users;
+            this.api = api;
+        }
+        
+        public void setUsers(UserStore users) { this.users = users; }
+        public void setApi(ApiClient api) { this.api = api; }
+        
+        @Override
+        public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
+            int page = 1;
+            if (args.length > 0) {
+                try {
+                    page = Integer.parseInt(args[0]);
+                    if (page < 1) page = 1;
+                } catch (NumberFormatException e) {
+                    sender.sendMessage(RED + "Invalid page number. Use /baltop [page]");
+                    return true;
+                }
+            }
+            
+            // Check if we need to update cache
+            if (System.currentTimeMillis() - lastCacheUpdate > 60000 || pageCache.isEmpty()) { // Update every minute
+                if (!isUpdating) {
+                    updateBaltopCache(sender, page);
+                } else {
+                    sender.sendMessage(YELLOW + "Balance top is being updated. Please wait...");
+                }
+            } else {
+                displayBaltop(sender, page);
+            }
+            
+            return true;
+        }
+        
+        private void updateBaltopCache(CommandSender requester, int requestedPage) {
+            isUpdating = true;
+            requester.sendMessage(YELLOW + "Scanning balances... This may take a moment.");
+            
+            Set<UUID> allUsers = users.getAllUsers();
+            List<BalanceEntry> entries = Collections.synchronizedList(new ArrayList<>());
+            AtomicInteger processed = new AtomicInteger(0);
+            
+            // Count valid users first and store in a final variable
+            List<UUID> validUsers = new ArrayList<>();
+            for (UUID uuid : allUsers) {
+                String card = users.getCard(uuid);
+                String name = users.getNick(uuid);
+                if (card != null && !card.isEmpty() && name != null && !name.isEmpty()) {
+                    validUsers.add(uuid);
+                }
+            }
+            
+            final int totalToProcess = validUsers.size();
+            
+            if (totalToProcess == 0) {
+                finishUpdate(entries, requestedPage, requester);
+                return;
+            }
+            
+            for (UUID uuid : validUsers) {
+                final String card = users.getCard(uuid);
+                final String name = users.getNick(uuid);
+                
+                // Process with delay between each request
+                long delay = processed.get() * 2L; // 2 ticks = 100ms delay between requests
+                Bukkit.getScheduler().runTaskLater(plugin, () -> {
+                    api.getCardInfo(card, new ApiClient.CardInfoResultCallback() {
+                        @Override
+                        public void onResult(ApiClient.CardInfoResult result) {
+                            if (result.success && result.coins != null) {
+                                BigDecimal balance = BigDecimal.valueOf(result.coins);
+                                entries.add(new BalanceEntry(name, balance, card));
+                            }
+                            
+                            int current = processed.incrementAndGet();
+                            if (current >= totalToProcess) {
+                                // All processed, sort and create cache
+                                finishUpdate(entries, requestedPage, requester);
+                            }
+                        }
+                    });
+                }, delay);
+            }
+        }
+        
+        private void finishUpdate(List<BalanceEntry> entries, int requestedPage, CommandSender requester) {
+            // Sort entries
+            Collections.sort(entries);
+            
+            // Calculate total server balance
+            BigDecimal total = BigDecimal.ZERO;
+            for (BalanceEntry entry : entries) {
+                total = total.add(entry.balance);
+            }
+            totalServerBalance = total;
+            
+            // Create page cache (10 per page)
+            pageCache.clear();
+            int page = 1;
+            List<BalanceEntry> currentPage = new ArrayList<>();
+            
+            for (int i = 0; i < entries.size(); i++) {
+                currentPage.add(entries.get(i));
+                if (currentPage.size() == 10 || i == entries.size() - 1) {
+                    pageCache.put(page++, new ArrayList<>(currentPage));
+                    currentPage.clear();
+                }
+            }
+            
+            totalPlayers = entries.size();
+            lastCacheUpdate = System.currentTimeMillis();
+            isUpdating = false;
+            
+            // Display requested page
+            displayBaltop(requester, requestedPage);
+        }
+        
+        private void displayBaltop(CommandSender sender, int page) {
+            if (pageCache.isEmpty()) {
+                sender.sendMessage(RED + "No balance data available yet. Try again in a moment.");
+                return;
+            }
+            
+            List<BalanceEntry> entries = pageCache.get(page);
+            if (entries == null) {
+                sender.sendMessage(RED + "Page " + page + " does not exist. Total pages: " + pageCache.size());
+                return;
+            }
+            
+            sender.sendMessage(GOLD + "=== Balance Top (Page " + page + "/" + pageCache.size() + ") ===");
+            sender.sendMessage(GRAY + "Total Server Balance: " + GREEN + DecimalUtil.formatFull(totalServerBalance));
+            sender.sendMessage(GRAY + "Total Players: " + WHITE + totalPlayers);
+            sender.sendMessage("");
+            
+            int startRank = (page - 1) * 10 + 1;
+            for (int i = 0; i < entries.size(); i++) {
+                BalanceEntry entry = entries.get(i);
+                int rank = startRank + i;
+                String rankColor = rank == 1 ? GOLD : (rank == 2 ? GRAY : (rank == 3 ? AQUA : WHITE));
+                
+                sender.sendMessage(rankColor + "#" + rank + " " + WHITE + entry.name + 
+                        GRAY + " -> " + GREEN + DecimalUtil.formatFull(entry.balance));
+            }
+            
+            sender.sendMessage("");
+            sender.sendMessage(GRAY + "Your position: " + findPlayerPosition(sender));
+            sender.sendMessage(GRAY + "Use " + YELLOW + "/baltop <page>" + GRAY + " to view other pages");
+        }
+        
+        private String findPlayerPosition(CommandSender sender) {
+            if (!(sender instanceof Player)) return "N/A";
+            
+            Player player = (Player) sender;
+            String playerCard = users.getCard(player.getUniqueId());
+            if (playerCard == null) return "No card set";
+            
+            int position = 1;
+            for (int page = 1; page <= pageCache.size(); page++) {
+                List<BalanceEntry> entries = pageCache.get(page);
+                if (entries == null) continue;
+                for (BalanceEntry entry : entries) {
+                    if (entry.card.equals(playerCard)) {
+                        return "#" + position;
+                    }
+                    position++;
+                }
+            }
+            
+            return "Not in top " + totalPlayers;
+        }
+    }
+    
+    /**
      * CoinCommand - /coin command (now based only on Card)
      */
-    public static class CoinCommand implements org.bukkit.command.CommandExecutor, org.bukkit.command.TabCompleter {
+    public static class CoinCommand implements CommandExecutor, TabCompleter {
         private final CoinCardPlugin plugin;
         private final UserStore users;
         private Economy eco;
@@ -1021,7 +1701,7 @@ public class CoinCardPlugin extends JavaPlugin {
         }
     
         @Override
-        public boolean onCommand(org.bukkit.command.CommandSender s, org.bukkit.command.Command c, String l, String[] a) {
+        public boolean onCommand(CommandSender s, Command c, String l, String[] a) {
             if (a.length == 0) {
                 s.sendMessage(YELLOW + "/coin card [card] " + GRAY + "- View or set your Card");
                 s.sendMessage(YELLOW + "/coin pay <player> <amount> " + GRAY + "- Pay using your Card");
@@ -1031,6 +1711,8 @@ public class CoinCardPlugin extends JavaPlugin {
                     s.sendMessage(RED + "/coin reload " + GRAY + "- Reload configuration");
                     s.sendMessage(RED + "/coin server pay <player> <amount> " + GRAY + "- Pay using Server Card");
                 }
+                s.sendMessage("");
+                s.sendMessage(GRAY + "Also available: " + YELLOW + "/pay, /balance, /bal, /baltop");
                 return true;
             }
     
@@ -1114,6 +1796,34 @@ public class CoinCardPlugin extends JavaPlugin {
                         return true;
                     }
                     s.sendMessage(RED + "Usage: " + YELLOW + "/coin server pay <player> <amount>");
+                    return true;
+                    
+                case "balance":
+                case "bal":
+                    // Redirecionar para o comando de balance
+                    if (s instanceof Player) {
+                        Player player = (Player) s;
+                        if (a.length > 1) {
+                            // /coin balance <player>
+                            String[] balanceArgs = {a[1]};
+                            plugin.getCommand("balance").execute(s, null, balanceArgs);
+                        } else {
+                            // /coin balance
+                            plugin.getCommand("balance").execute(s, null, new String[0]);
+                        }
+                    } else {
+                        s.sendMessage(RED + "Players only.");
+                    }
+                    return true;
+                    
+                case "baltop":
+                    // Redirecionar para o comando baltop
+                    if (a.length > 1) {
+                        String[] baltopArgs = {a[1]};
+                        plugin.getCommand("baltop").execute(s, null, baltopArgs);
+                    } else {
+                        plugin.getCommand("baltop").execute(s, null, new String[0]);
+                    }
                     return true;
                     
                 default:
@@ -1332,7 +2042,7 @@ public class CoinCardPlugin extends JavaPlugin {
             });
         }
     
-        private void serverPay(org.bukkit.command.CommandSender s, String targetName, String amountStr) {
+        private void serverPay(CommandSender s, String targetName, String amountStr) {
             String serverCard = cfg.getServerCard();
             if (serverCard == null || serverCard.isEmpty()) {
                 s.sendMessage(RED + "Invalid configuration (Server Card).");
@@ -1391,13 +2101,13 @@ public class CoinCardPlugin extends JavaPlugin {
         }
     
         @Override
-        public List<String> onTabComplete(org.bukkit.command.CommandSender s, org.bukkit.command.Command c, 
+        public List<String> onTabComplete(CommandSender s, Command c, 
                                           String l, String[] a) {
             List<String> out = new ArrayList<>();
             
             if (a.length == 1) {
                 // First argument: subcommands
-                out.addAll(Arrays.asList("card", "pay", "buy", "sell"));
+                out.addAll(Arrays.asList("card", "pay", "buy", "sell", "balance", "bal", "baltop"));
                 if (s.hasPermission("coin.admin")) {
                     out.addAll(Arrays.asList("reload", "server"));
                 }
@@ -1406,9 +2116,17 @@ public class CoinCardPlugin extends JavaPlugin {
             
             if (a.length == 2) {
                 // Second argument
-                if (a[0].equalsIgnoreCase("pay") || (a[0].equalsIgnoreCase("server") && a.length == 2)) {
+                if (a[0].equalsIgnoreCase("pay") || a[0].equalsIgnoreCase("server") && a.length == 2) {
                     // For tab completion, we can only show online players
                     // But the command will work with offline players too
+                    out.addAll(Bukkit.getOnlinePlayers().stream()
+                                     .map(Player::getName)
+                                     .collect(Collectors.toList()));
+                    return filter(out, a[1]);
+                }
+                
+                if (a[0].equalsIgnoreCase("balance") || a[0].equalsIgnoreCase("bal")) {
+                    // Suggest players for balance command
                     out.addAll(Bukkit.getOnlinePlayers().stream()
                                      .map(Player::getName)
                                      .collect(Collectors.toList()));

@@ -1,15 +1,72 @@
 name: CoinCard
-version: 1.5
+version: 1.6
 main: com.foxsrv.coincard.CoinCardPlugin
 api-version: "1.20"
 depend: [Vault]
 softdepend: [PlaceholderAPI]
 author: FoxSRV
+description: Advanced card-based coin transaction system with encryption
+
 commands:
   coin:
-    description: Main Command
-    usage: /coin <subcommand>
+    description: Main CoinCard command
+    aliases: [c]
+    usage: |
+      /coin - Show help
+      /coin card [card] - View or set your card
+      /coin pay <player> <amount> - Pay using your card
+      /coin buy <coins> - Convert coins to vault
+      /coin sell <vault> - Convert vault to coins
+      /coin balance [player] - Check balance (alias)
+      /coin bal [player] - Check balance (alias)
+      /coin baltop [page] - View top balances (alias)
+      /coin reload - Reload configuration (admin)
+      /coin server pay <player> <amount> - Pay using server card (admin)
+    permission: coin.use
+  
+  pay:
+    description: Pay another player using your card
+    usage: /pay <player> <amount>
+    permission: coin.pay
+  
+  balance:
+    description: Check your or another player's balance
+    aliases: [bal]
+    usage: /balance [player]
+    permission: coin.balance
+  
+  baltop:
+    description: View top balances with pagination
+    usage: /baltop [page]
+    permission: coin.baltop
+
 permissions:
-  coin.admin:
-    description: Permission for adm commands
+  coin.*:
+    description: All CoinCard permissions
     default: op
+    children:
+      coin.use: true
+      coin.admin: true
+      coin.pay: true
+      coin.balance: true
+      coin.baltop: true
+  
+  coin.use:
+    description: Use basic CoinCard commands
+    default: true
+  
+  coin.admin:
+    description: Administrative commands (reload, server pay)
+    default: op
+  
+  coin.pay:
+    description: Use /pay command
+    default: true
+  
+  coin.balance:
+    description: Use /balance and /bal commands
+    default: true
+  
+  coin.baltop:
+    description: Use /baltop command
+    default: true
