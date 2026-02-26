@@ -9,6 +9,10 @@ Depends on Vault and an econnomy plugin.
 
 # Made for Minecraft 1.20+ Servers.
 
+Placeholder: %coin_user%
+
+Depends: https://www.spigotmc.org/resources/placeholderapi.6245/
+
 Commands:
 
 - coin or coincard (main)
