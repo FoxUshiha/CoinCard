@@ -17,6 +17,9 @@ Commands:
 - card (setups your coin card to use)
 - server pay (pays coins using server card to users)
 - reload (reloads the server configs)
+- balance
+- pay
+- baltop
 
 It has the card payment and user coins management exported to API.
 It means that some other coin plugins now depends on this plugin.
