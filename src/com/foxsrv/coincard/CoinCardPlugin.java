@@ -12,7 +12,7 @@ import org.bukkit.plugin.RegisteredServiceProvider;
 import org.bukkit.plugin.ServicePriority;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.configuration.file.YamlConfiguration;
-import org.bukkit.configuration.InvalidConfigurationException;
+import org.bukkit.scheduler.BukkitTask;
 
 import net.milkbowl.vault.economy.Economy;
 
@@ -34,15 +34,16 @@ import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
 import java.security.spec.KeySpec;
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
 
 /**
  * CoinCardPlugin - Main plugin class
  * Provides card-based coin transactions with Vault integration
+ * Fully asynchronous version with aggressive caching and rate limiting
  */
 public class CoinCardPlugin extends JavaPlugin {
     private static CoinCardPlugin instance;
@@ -56,12 +57,16 @@ public class CoinCardPlugin extends JavaPlugin {
     private QueueService queue;
     private CooldownManager cooldowns;
     private CoinPlaceholderExpansion placeholderExpansion;
+    private BalanceCacheManager balanceCache;
     
     // Command reference
     private CoinCommand coinCommand;
     private PayCommand payCommand;
     private BalanceCommand balanceCommand;
     private BalTopCommand balTopCommand;
+    
+    // Thread pool for async tasks
+    private ExecutorService asyncExecutor;
     
     // Encryption
     private static final String ENCRYPTION_SALT = "CoinCardSalt2024!";
@@ -84,7 +89,7 @@ public class CoinCardPlugin extends JavaPlugin {
         // Save default configs
         saveDefaultConfig();
         
-        // Criar arquivo users.dat se não existir
+        // Create users.dat if it doesn't exist
         File usersFile = new File(getDataFolder(), "users.dat");
         if (!usersFile.exists()) {
             try {
@@ -108,12 +113,17 @@ public class CoinCardPlugin extends JavaPlugin {
             getLogger().warning("PlaceholderAPI not found. Placeholders will not be available.");
         }
         
-        // Initialize components
-        users = new UserStore(this);
-        users.load();
-        users.migrateFromYaml(); // Migrar dados do YAML antigo se existir
+        // Initialize thread pool
+        asyncExecutor = Executors.newCachedThreadPool();
         
-        apiClient = new ApiClient(config.getApiBase(), config.getTimeoutMs(), getLogger());
+        // Initialize components (async loading)
+        users = new UserStore(this);
+        users.loadAsync();
+        
+        balanceCache = new BalanceCacheManager(this);
+        balanceCache.loadFromDiskAsync();
+        
+        apiClient = new ApiClient(config.getApiBase(), config.getTimeoutMs(), getLogger(), balanceCache);
         queue = new QueueService(this, config.getQueueIntervalTicks());
         cooldowns = new CooldownManager(config.getPerUserCooldownMs());
         
@@ -124,12 +134,12 @@ public class CoinCardPlugin extends JavaPlugin {
         getServer().getServicesManager().register(CoinCardAPI.class, api, this, ServicePriority.Normal);
         
         // Register commands
-        coinCommand = new CoinCommand(this, users, apiClient, queue, cooldowns, economy, config);
-        payCommand = new PayCommand(this, users, apiClient, queue, cooldowns, config);
-        balanceCommand = new BalanceCommand(this, users, apiClient);
-        balTopCommand = new BalTopCommand(this, users, apiClient);
+        coinCommand = new CoinCommand(this, users, apiClient, queue, cooldowns, economy, config, balanceCache);
+        payCommand = new PayCommand(this, users, apiClient, queue, cooldowns, config, balanceCache);
+        balanceCommand = new BalanceCommand(this, users, apiClient, balanceCache);
+        balTopCommand = new BalTopCommand(this, users, apiClient, balanceCache);
         
-        // Registro de todos os comandos e aliases
+        // Register all commands and aliases
         Objects.requireNonNull(getCommand("coin")).setExecutor(coinCommand);
         Objects.requireNonNull(getCommand("coin")).setTabCompleter(coinCommand);
         Objects.requireNonNull(getCommand("c")).setExecutor(coinCommand);
@@ -144,20 +154,34 @@ public class CoinCardPlugin extends JavaPlugin {
         
         // Register placeholder if PlaceholderAPI is available
         if (Bukkit.getPluginManager().getPlugin("PlaceholderAPI") != null) {
-            placeholderExpansion = new CoinPlaceholderExpansion(this, apiClient, users);
+            placeholderExpansion = new CoinPlaceholderExpansion(this, apiClient, users, balanceCache);
             placeholderExpansion.register();
-            getLogger().info("Placeholder %coin_user% registered.");
+            getLogger().info("Placeholder %coin_user% registered with 30s cache.");
         }
         
         getLogger().info("CoinCard v" + getDescription().getVersion() + " enabled.");
         getLogger().info("Commands: /coin, /c, /pay, /balance, /bal, /baltop");
+        getLogger().info("Fully asynchronous and optimized.");
     }
     
     @Override
     public void onDisable() {
-        if (users != null) users.save();
+        // Shutdown executor and save data
+        if (asyncExecutor != null) {
+            asyncExecutor.shutdown();
+            try {
+                if (!asyncExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
+                    asyncExecutor.shutdownNow();
+                }
+            } catch (InterruptedException e) {
+                asyncExecutor.shutdownNow();
+            }
+        }
+        
+        if (balanceCache != null) balanceCache.saveToDiskAsync();
+        if (users != null) users.saveAsync();
         if (queue != null) queue.shutdown();
-        if (placeholderExpansion != null) placeholderExpansion.unregister();
+        if (placeholderExpansion != null) placeholderExpansion.shutdown();
         if (api instanceof CoinCardAPIImpl) {
             ((CoinCardAPIImpl) api).shutdown();
         }
@@ -166,12 +190,10 @@ public class CoinCardPlugin extends JavaPlugin {
     
     private void initEncryption() {
         try {
-            // Generate random IV
             SecureRandom random = new SecureRandom();
             encryptionIv = new byte[16];
             random.nextBytes(encryptionIv);
             
-            // Generate key from password
             SecretKeyFactory factory = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256");
             KeySpec spec = new PBEKeySpec(ENCRYPTION_PASSWORD.toCharArray(), 
                     ENCRYPTION_SALT.getBytes(), ENCRYPTION_ITERATIONS, ENCRYPTION_KEY_LENGTH);
@@ -213,9 +235,9 @@ public class CoinCardPlugin extends JavaPlugin {
     
     public void applyRuntimeConfig() {
         if (users == null) users = new UserStore(this);
-        users.load();
+        users.loadAsync(); // Reload async
         
-        this.apiClient = new ApiClient(config.getApiBase(), config.getTimeoutMs(), getLogger());
+        this.apiClient = new ApiClient(config.getApiBase(), config.getTimeoutMs(), getLogger(), balanceCache);
         this.cooldowns = new CooldownManager(config.getPerUserCooldownMs());
         
         if (queue != null) queue.shutdown();
@@ -250,7 +272,6 @@ public class CoinCardPlugin extends JavaPlugin {
             placeholderExpansion.setUsers(users);
         }
         
-        // Update API implementation
         if (api instanceof CoinCardAPIImpl) {
             ((CoinCardAPIImpl) api).updateComponents(apiClient, users, config, queue);
         }
@@ -275,6 +296,8 @@ public class CoinCardPlugin extends JavaPlugin {
     public QueueService getQueue() { return queue; }
     public CooldownManager getCooldowns() { return cooldowns; }
     public UserStore getUserStore() { return users; }
+    public BalanceCacheManager getBalanceCache() { return balanceCache; }
+    public ExecutorService getAsyncExecutor() { return asyncExecutor; }
     
     public OfflinePlayer getServerVaultAccount() {
         try {
@@ -287,153 +310,40 @@ public class CoinCardPlugin extends JavaPlugin {
     
     // ==================== PUBLIC API INTERFACE ====================
     
-    /**
-     * CoinCardAPI - Public API for other plugins to interact with CoinCard
-     */
     public interface CoinCardAPI {
-        /**
-         * Gets a player's card by UUID
-         * @param uuid Player's UUID
-         * @return Card string or null if not set
-         */
         String getPlayerCard(UUID uuid);
-        
-        /**
-         * Gets a player's card by nickname (works for offline players)
-         * @param nick Player's nickname
-         * @return Card string or null if not found
-         */
         String getPlayerCardByNick(String nick);
-        
-        /**
-         * Sets a player's card
-         * @param uuid Player's UUID
-         * @param card Card to set
-         * @return true if successful
-         */
         boolean setPlayerCard(UUID uuid, String card);
-        
-        /**
-         * Gets a player's nickname by UUID
-         * @param uuid Player's UUID
-         * @return Nickname or null
-         */
         String getPlayerNick(UUID uuid);
-        
-        /**
-         * Gets a player's UUID by nickname (works for offline players)
-         * @param nick Player's nickname
-         * @return UUID or null if not found
-         */
         UUID getPlayerUUIDByNick(String nick);
-        
-        /**
-         * Performs an asynchronous transfer from one card to another
-         * @param fromCard Source card
-         * @param toCard Destination card
-         * @param amount Amount to transfer
-         * @param callback Callback for result
-         */
         void transfer(String fromCard, String toCard, double amount, TransferCallback callback);
-        
-        /**
-         * Performs a synchronous transfer (blocking - use with caution!)
-         * @param fromCard Source card
-         * @param toCard Destination card
-         * @param amount Amount to transfer
-         * @return Transfer result
-         */
         ApiClient.CardTransferResult transferSync(String fromCard, String toCard, double amount);
-        
-        /**
-         * Gets a card's balance asynchronously
-         * @param card Card to check
-         * @param callback Callback with balance
-         */
         void getBalance(String card, BalanceCallback callback);
-        
-        /**
-         * Gets a player's balance by UUID
-         * @param uuid Player's UUID
-         * @param callback Callback with balance
-         */
         void getPlayerBalance(UUID uuid, BalanceCallback callback);
-        
-        /**
-         * Gets a player's balance by nickname (works for offline players)
-         * @param nick Player's nickname
-         * @param callback Callback with balance
-         */
         void getPlayerBalanceByNick(String nick, BalanceCallback callback);
-        
-        /**
-         * Checks if a player has a card set
-         * @param uuid Player's UUID
-         * @return true if player has a card
-         */
         boolean hasCard(UUID uuid);
-        
-        /**
-         * Checks if a nickname has a card set (works for offline players)
-         * @param nick Player's nickname
-         * @return true if player has a card
-         */
         boolean hasCardByNick(String nick);
-        
-        /**
-         * Gets the server's card
-         * @return Server card string
-         */
         String getServerCard();
-        
-        /**
-         * Gets the server's vault account UUID
-         * @return Server vault UUID
-         */
         String getServerVaultUUID();
-        
-        /**
-         * Adds a balance listener for a specific card
-         * @param card Card to monitor
-         * @param listener Listener to add
-         */
         void addBalanceListener(String card, BalanceListener listener);
-        
-        /**
-         * Removes a balance listener
-         * @param card Card being monitored
-         * @param listener Listener to remove
-         */
         void removeBalanceListener(String card, BalanceListener listener);
     }
     
-    /**
-     * Callback for transfer operations
-     */
     public interface TransferCallback {
         void onSuccess(String txId, double amount);
         void onFailure(String error);
     }
     
-    /**
-     * Callback for balance queries
-     */
     public interface BalanceCallback {
         void onResult(double balance, String error);
     }
     
-    /**
-     * Listener for balance changes
-     */
     public interface BalanceListener {
         void onBalanceChange(String card, double oldBalance, double newBalance);
     }
     
     // ==================== API IMPLEMENTATION ====================
     
-    /**
-     * CoinCardAPIImpl - Implementation of the public API
-     */
     public static class CoinCardAPIImpl implements CoinCardAPI {
         private final CoinCardPlugin plugin;
         private ApiClient api;
@@ -442,7 +352,6 @@ public class CoinCardPlugin extends JavaPlugin {
         private QueueService queue;
         private final Map<String, List<BalanceListener>> balanceListeners = new ConcurrentHashMap<>();
         private final Map<String, Double> lastKnownBalance = new ConcurrentHashMap<>();
-        private int monitorTaskId = -1;
         
         public CoinCardAPIImpl(CoinCardPlugin plugin) {
             this.plugin = plugin;
@@ -450,7 +359,6 @@ public class CoinCardPlugin extends JavaPlugin {
             this.users = plugin.users;
             this.config = plugin.config;
             this.queue = plugin.queue;
-            startBalanceMonitor();
         }
         
         public void updateComponents(ApiClient api, UserStore users, ConfigManager config, QueueService queue) {
@@ -502,12 +410,12 @@ public class CoinCardPlugin extends JavaPlugin {
             
             final double fAmount = DecimalUtil.truncate(amount, 8);
             
-            Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
+            // Async execution
+            plugin.getAsyncExecutor().submit(() -> {
                 ApiClient.CardTransferResult result = api.transferByCard(fromCard, toCard, fAmount);
                 
                 Bukkit.getScheduler().runTask(plugin, () -> {
                     if (result.success) {
-                        // Update cached balances
                         updateCachedBalance(fromCard, -fAmount);
                         updateCachedBalance(toCard, fAmount);
                         callback.onSuccess(result.txId, fAmount);
@@ -525,8 +433,6 @@ public class CoinCardPlugin extends JavaPlugin {
             }
             
             final double fAmount = DecimalUtil.truncate(amount, 8);
-            
-            // This is a blocking call - use with caution!
             ApiClient.CardTransferResult result = api.transferByCard(fromCard, toCard, fAmount);
             
             if (result.success) {
@@ -544,13 +450,20 @@ public class CoinCardPlugin extends JavaPlugin {
                 return;
             }
             
-            Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
+            Double cached = plugin.balanceCache.getBalance(card);
+            if (cached != null) {
+                callback.onResult(cached, null);
+                return;
+            }
+            
+            plugin.getAsyncExecutor().submit(() -> {
                 ApiClient.CardInfoResult result = api.getCardInfo(card);
                 
                 Bukkit.getScheduler().runTask(plugin, () -> {
                     if (result.success && result.coins != null) {
                         double oldBalance = lastKnownBalance.getOrDefault(card, 0.0);
                         lastKnownBalance.put(card, result.coins);
+                        plugin.balanceCache.setBalance(card, result.coins);
                         
                         if (oldBalance != result.coins) {
                             notifyBalanceChange(card, oldBalance, result.coins);
@@ -621,8 +534,9 @@ public class CoinCardPlugin extends JavaPlugin {
         }
         
         private void updateCachedBalance(String card, double delta) {
-            double oldBalance = lastKnownBalance.getOrDefault(card, 0.0);
-            double newBalance = oldBalance + delta;
+            double oldBalance = plugin.balanceCache.getBalanceOrDefault(card, 0.0);
+            double newBalance = DecimalUtil.truncate(oldBalance + delta, 8);
+            plugin.balanceCache.setBalance(card, newBalance);
             lastKnownBalance.put(card, newBalance);
             notifyBalanceChange(card, oldBalance, newBalance);
         }
@@ -630,7 +544,6 @@ public class CoinCardPlugin extends JavaPlugin {
         private void notifyBalanceChange(String card, double oldBalance, double newBalance) {
             List<BalanceListener> listeners = balanceListeners.get(card);
             if (listeners != null) {
-                // Create a copy to avoid concurrent modification
                 List<BalanceListener> copy = new ArrayList<>(listeners);
                 for (BalanceListener listener : copy) {
                     try {
@@ -642,37 +555,163 @@ public class CoinCardPlugin extends JavaPlugin {
             }
         }
         
-        private void startBalanceMonitor() {
-            monitorTaskId = Bukkit.getScheduler().scheduleSyncRepeatingTask(plugin, () -> {
-                // Periodically update balances for monitored cards
-                if (!balanceListeners.isEmpty()) {
-                    Set<String> cardsToMonitor = new HashSet<>(balanceListeners.keySet());
-                    for (String card : cardsToMonitor) {
-                        getBalance(card, new BalanceCallback() {
-                            @Override
-                            public void onResult(double balance, String error) {
-                                // Balance already updated via getBalance
-                            }
-                        });
-                    }
-                }
-            }, 200L, 200L); // Update every 10 seconds
-        }
-        
         public void shutdown() {
-            if (monitorTaskId != -1) {
-                Bukkit.getScheduler().cancelTask(monitorTaskId);
-            }
             balanceListeners.clear();
             lastKnownBalance.clear();
         }
     }
     
+    // ==================== BALANCE CACHE MANAGER ====================
+    
+    public static class BalanceCacheManager {
+        private final CoinCardPlugin plugin;
+        private final Map<String, CachedBalance> cache = new ConcurrentHashMap<>();
+        private final File cacheFile;
+        private final long CACHE_DURATION_MS = 30000; // 30 seconds
+        private final Object saveLock = new Object();
+        private volatile boolean dirty = false;
+        private BukkitTask saveTask; // Changed from ScheduledFuture<?> to BukkitTask
+        
+        private static class CachedBalance implements Serializable {
+            private static final long serialVersionUID = 1L;
+            final double balance;
+            final long timestamp;
+            
+            CachedBalance(double balance, long timestamp) {
+                this.balance = balance;
+                this.timestamp = timestamp;
+            }
+            
+            boolean isValid(long currentTime) {
+                return (currentTime - timestamp) < 30000;
+            }
+        }
+        
+        public BalanceCacheManager(CoinCardPlugin plugin) {
+            this.plugin = plugin;
+            this.cacheFile = new File(plugin.getDataFolder(), "balance_cache.dat");
+            // Schedule periodic save
+            this.saveTask = Bukkit.getScheduler().runTaskTimerAsynchronously(plugin, this::saveIfDirty, 6000L, 6000L);
+        }
+        
+        public Double getBalance(String card) {
+            CachedBalance cached = cache.get(card);
+            if (cached != null && cached.isValid(System.currentTimeMillis())) {
+                return cached.balance;
+            }
+            return null;
+        }
+        
+        public double getBalanceOrDefault(String card, double defaultValue) {
+            Double balance = getBalance(card);
+            return balance != null ? balance : defaultValue;
+        }
+        
+        public void setBalance(String card, double balance) {
+            cache.put(card, new CachedBalance(DecimalUtil.truncate(balance, 8), System.currentTimeMillis()));
+            markDirty();
+        }
+        
+        public void removeBalance(String card) {
+            cache.remove(card);
+            markDirty();
+        }
+        
+        private void markDirty() {
+            dirty = true;
+        }
+        
+        private void saveIfDirty() {
+            if (dirty) {
+                saveToDiskAsync();
+            }
+        }
+        
+        @SuppressWarnings("unchecked")
+        public void loadFromDiskAsync() {
+            plugin.getAsyncExecutor().submit(() -> {
+                if (!cacheFile.exists()) {
+                    plugin.getLogger().info("Balance cache file does not exist, starting fresh.");
+                    return;
+                }
+                
+                try (FileInputStream fis = new FileInputStream(cacheFile);
+                     ObjectInputStream ois = new ObjectInputStream(fis)) {
+                    
+                    Map<String, CachedBalance> loaded = (Map<String, CachedBalance>) ois.readObject();
+                    long now = System.currentTimeMillis();
+                    int validCount = 0;
+                    
+                    for (Map.Entry<String, CachedBalance> entry : loaded.entrySet()) {
+                        if (entry.getValue().isValid(now)) {
+                            cache.put(entry.getKey(), entry.getValue());
+                            validCount++;
+                        }
+                    }
+                    
+                    plugin.getLogger().info("Loaded " + validCount + " valid balances from disk cache.");
+                    
+                } catch (Exception e) {
+                    plugin.getLogger().warning("Failed to load balance cache: " + e.getMessage());
+                }
+            });
+        }
+        
+        public void saveToDiskAsync() {
+            plugin.getAsyncExecutor().submit(() -> {
+                if (!dirty) return;
+                
+                try {
+                    if (!plugin.getDataFolder().exists()) {
+                        plugin.getDataFolder().mkdirs();
+                    }
+                    
+                    File tempFile = new File(plugin.getDataFolder(), "balance_cache.dat.tmp");
+                    
+                    try (FileOutputStream fos = new FileOutputStream(tempFile);
+                         ObjectOutputStream oos = new ObjectOutputStream(fos)) {
+                        
+                        oos.writeObject(new HashMap<>(cache));
+                        oos.flush();
+                    }
+                    
+                    synchronized (saveLock) {
+                        if (cacheFile.exists() && !cacheFile.delete()) {
+                            plugin.getLogger().warning("Could not delete old balance cache file.");
+                        }
+                        if (tempFile.renameTo(cacheFile)) {
+                            dirty = false;
+                            plugin.getLogger().info("Saved " + cache.size() + " balances to disk cache.");
+                        }
+                    }
+                    
+                } catch (Exception e) {
+                    plugin.getLogger().warning("Failed to save balance cache: " + e.getMessage());
+                }
+            });
+        }
+        
+        public Map<String, Double> getAllBalances() {
+            Map<String, Double> result = new HashMap<>();
+            long now = System.currentTimeMillis();
+            for (Map.Entry<String, CachedBalance> entry : cache.entrySet()) {
+                if (entry.getValue().isValid(now)) {
+                    result.put(entry.getKey(), entry.getValue().balance);
+                }
+            }
+            return result;
+        }
+        
+        public void shutdown() {
+            if (saveTask != null) {
+                saveTask.cancel();
+            }
+            saveToDiskAsync();
+        }
+    }
+    
     // ==================== INNER CLASSES ====================
     
-    /**
-     * ConfigManager - Manages plugin configuration
-     */
     public static class ConfigManager {
         private final String serverVaultUUID;
         private final String serverCard;
@@ -688,7 +727,7 @@ public class CoinCardPlugin extends JavaPlugin {
             this.serverCard = c.getString("Card", "");
             this.buyVaultPerCoin = c.getDouble("Buy", 0.0D);
             this.sellCoinsPerVault = c.getDouble("Sell", 0.0D);
-            this.apiBase = c.getString("API", "http://127.0.0.1:26450/");
+            this.apiBase = c.getString("API", "https://bank.foxsrv.net/");
             this.queueIntervalTicks = c.getInt("QueueIntervalTicks", 20);
             this.perUserCooldownMs = c.getLong("PerUserCooldownMs", 1000L);
             this.timeoutMs = c.getInt("TimeoutMs", 10000);
@@ -704,18 +743,18 @@ public class CoinCardPlugin extends JavaPlugin {
         public int getTimeoutMs() { return timeoutMs; }
     }
     
-    /**
-     * UserStore - Manages user data (UUID -> Card) with encryption
-     */
     public static class UserStore {
         private final CoinCardPlugin plugin;
         private final File file;
         private final Map<UUID, UserData> data = new ConcurrentHashMap<>();
-        private boolean dirty = false;
+        private volatile boolean dirty = false;
+        private BukkitTask saveTask; // Changed from ScheduledFuture<?> to BukkitTask
     
         public UserStore(CoinCardPlugin plugin) {
             this.plugin = plugin;
             this.file = new File(plugin.getDataFolder(), "users.dat");
+            // Schedule periodic save
+            this.saveTask = Bukkit.getScheduler().runTaskTimerAsynchronously(plugin, this::saveIfDirty, 6000L, 6000L);
         }
         
         private static class UserData implements Serializable {
@@ -730,52 +769,95 @@ public class CoinCardPlugin extends JavaPlugin {
         }
     
         @SuppressWarnings("unchecked")
-        public void load() {
-            if (!file.exists()) {
-                return;
-            }
-            
-            if (file.length() == 0) {
-                plugin.getLogger().info("users.dat is empty, starting fresh.");
-                return;
-            }
-            
-            try (FileInputStream fis = new FileInputStream(file);
-                 ObjectInputStream ois = new ObjectInputStream(fis)) {
-                
-                // Read encrypted data
-                int length = ois.readInt();
-                byte[] encryptedData = new byte[length];
-                ois.readFully(encryptedData);
-                
-                // Decrypt
-                byte[] decryptedData = plugin.decrypt(encryptedData);
-                
-                // Deserialize
-                try (ByteArrayInputStream bais = new ByteArrayInputStream(decryptedData);
-                     ObjectInputStream dataOis = new ObjectInputStream(bais)) {
-                    
-                    Map<UUID, UserData> loaded = (Map<UUID, UserData>) dataOis.readObject();
-                    data.clear();
-                    data.putAll(loaded);
+        public void loadAsync() {
+            plugin.getAsyncExecutor().submit(() -> {
+                if (!file.exists()) {
+                    plugin.getLogger().info("users.dat does not exist, starting new file.");
+                    return;
                 }
                 
-                plugin.getLogger().info("Loaded " + data.size() + " users from encrypted database.");
+                if (file.length() == 0) {
+                    plugin.getLogger().info("users.dat is empty, starting new file.");
+                    file.delete();
+                    return;
+                }
                 
-            } catch (EOFException e) {
-                plugin.getLogger().warning("users.dat is corrupted or empty, starting fresh.");
-                data.clear();
+                try (FileInputStream fis = new FileInputStream(file);
+                     ObjectInputStream ois = new ObjectInputStream(fis)) {
+                    
+                    Map<UUID, UserData> loaded = (Map<UUID, UserData>) ois.readObject();
+                    data.clear();
+                    data.putAll(loaded);
+                    plugin.getLogger().info("Loaded " + data.size() + " users from users.dat.");
+                    
+                } catch (EOFException e) {
+                    plugin.getLogger().warning("users.dat corrupted, creating backup.");
+                    fazerBackupArquivoCorrompido();
+                    data.clear();
+                } catch (Exception e) {
+                    plugin.getLogger().severe("Failed to load users.dat: " + e.getMessage());
+                    fazerBackupArquivoCorrompido();
+                    data.clear();
+                }
+            });
+        }
+        
+        private void fazerBackupArquivoCorrompido() {
+            try {
+                File backup = new File(plugin.getDataFolder(), "users.dat.corrompido." + System.currentTimeMillis() + ".bak");
+                if (file.renameTo(backup)) {
+                    plugin.getLogger().info("Corrupted file saved as: " + backup.getName());
+                } else {
+                    file.delete();
+                }
             } catch (Exception e) {
-                plugin.getLogger().severe("Failed to load users.dat: " + e.getMessage());
-                data.clear();
+                file.delete();
+            }
+        }
+    
+        private void saveIfDirty() {
+            if (dirty) {
+                saveAsync();
             }
         }
         
+        public void saveAsync() {
+            plugin.getAsyncExecutor().submit(() -> {
+                if (!dirty) return;
+                
+                try {
+                    if (!plugin.getDataFolder().exists()) {
+                        plugin.getDataFolder().mkdirs();
+                    }
+                    
+                    File tempFile = new File(plugin.getDataFolder(), "users.dat.tmp");
+                    
+                    try (FileOutputStream fos = new FileOutputStream(tempFile);
+                         ObjectOutputStream oos = new ObjectOutputStream(fos)) {
+                        
+                        oos.writeObject(new HashMap<>(data));
+                        oos.flush();
+                    }
+                    
+                    synchronized (this) {
+                        if (file.exists() && !file.delete()) {
+                            plugin.getLogger().warning("Could not delete old users.dat");
+                        }
+                        if (tempFile.renameTo(file)) {
+                            dirty = false;
+                            plugin.getLogger().info("Saved " + data.size() + " users to users.dat.");
+                        }
+                    }
+                    
+                } catch (Exception e) {
+                    plugin.getLogger().severe("Failed to save users.dat: " + e.getMessage());
+                }
+            });
+        }
+    
         public void migrateFromYaml() {
             File yamlFile = new File(plugin.getDataFolder(), "users.yml");
-            if (!yamlFile.exists()) {
-                return;
-            }
+            if (!yamlFile.exists()) return;
             
             try {
                 YamlConfiguration yaml = new YamlConfiguration();
@@ -798,53 +880,14 @@ public class CoinCardPlugin extends JavaPlugin {
                 }
                 
                 if (migrated > 0) {
-                    plugin.getLogger().info("Migrated " + migrated + " users from users.yml to encrypted format.");
-                    save();
-                    
-                    // Renomear o arquivo antigo como backup
+                    plugin.getLogger().info("Migrated " + migrated + " users from users.yml to users.dat.");
+                    saveAsync();
                     File backupFile = new File(plugin.getDataFolder(), "users.yml.bak");
-                    if (yamlFile.renameTo(backupFile)) {
-                        plugin.getLogger().info("Renamed old users.yml to users.yml.bak");
-                    } else {
-                        plugin.getLogger().warning("Could not rename users.yml, you may delete it manually.");
-                    }
+                    yamlFile.renameTo(backupFile);
                 }
                 
             } catch (Exception e) {
                 plugin.getLogger().warning("Failed to migrate from users.yml: " + e.getMessage());
-            }
-        }
-    
-        public void save() {
-            if (!dirty) return;
-            
-            try {
-                if (!plugin.getDataFolder().exists()) {
-                    plugin.getDataFolder().mkdirs();
-                }
-                
-                // Serialize data
-                ByteArrayOutputStream baos = new ByteArrayOutputStream();
-                try (ObjectOutputStream oos = new ObjectOutputStream(baos)) {
-                    oos.writeObject(new HashMap<>(data));
-                }
-                byte[] serializedData = baos.toByteArray();
-                
-                // Encrypt
-                byte[] encryptedData = plugin.encrypt(serializedData);
-                
-                // Write to file
-                try (FileOutputStream fos = new FileOutputStream(file);
-                     ObjectOutputStream oos = new ObjectOutputStream(fos)) {
-                    
-                    oos.writeInt(encryptedData.length);
-                    oos.write(encryptedData);
-                }
-                
-                dirty = false;
-                
-            } catch (Exception e) {
-                plugin.getLogger().severe("Failed to save users.dat: " + e.getMessage());
             }
         }
     
@@ -862,8 +905,8 @@ public class CoinCardPlugin extends JavaPlugin {
                 ud.card = card;
                 dirty = true;
             }
-            // Auto-save after setting card (important data)
-            save();
+            // Save async but we don't need to wait
+            saveAsync();
         }
     
         public String getNick(UUID uuid) { 
@@ -897,11 +940,15 @@ public class CoinCardPlugin extends JavaPlugin {
         }
         
         public int size() { return data.size(); }
+        
+        public void shutdown() {
+            if (saveTask != null) {
+                saveTask.cancel();
+            }
+            saveAsync();
+        }
     }
     
-    /**
-     * CooldownManager - Manages per-user cooldowns
-     */
     public static class CooldownManager {
         private final long cooldownMs;
         private final Map<UUID, Long> lastUse = new ConcurrentHashMap<>();
@@ -919,9 +966,6 @@ public class CoinCardPlugin extends JavaPlugin {
         }
     }
     
-    /**
-     * QueueService - Synchronous task queue
-     */
     public static class QueueService {
         private final Queue<Runnable> tasks = new ConcurrentLinkedQueue<>();
         private final int taskId;
@@ -941,9 +985,6 @@ public class CoinCardPlugin extends JavaPlugin {
         public void shutdown() { Bukkit.getScheduler().cancelTask(taskId); tasks.clear(); }
     }
     
-    /**
-     * DecimalUtil - Utility for truncating decimals
-     */
     public static class DecimalUtil {
         public static double truncate(double value, int scale) {
             if (scale < 0) scale = 0;
@@ -954,8 +995,6 @@ public class CoinCardPlugin extends JavaPlugin {
         
         public static String formatFull(double value) {
             if (value == 0) return "0";
-            
-            // Remove trailing zeros
             BigDecimal bd = BigDecimal.valueOf(value).stripTrailingZeros();
             return bd.toPlainString();
         }
@@ -966,14 +1005,13 @@ public class CoinCardPlugin extends JavaPlugin {
         }
     }
     
-    /**
-     * ApiClient - HTTP client for Coin API
-     */
     public static class ApiClient {
         private final String baseUrl;
         private final int timeoutMs;
         private final Logger log;
-    
+        private final BalanceCacheManager cache;
+        private final RateLimiter rateLimiter;
+        
         public static class CardTransferResult {
             public final boolean success;
             public final String txId;
@@ -996,23 +1034,23 @@ public class CoinCardPlugin extends JavaPlugin {
             }
         }
         
-        /**
-         * Callback interface for CardInfoResult
-         */
         public interface CardInfoResultCallback {
             void onResult(CardInfoResult result);
         }
     
-        public ApiClient(String baseUrl, int timeoutMs, Logger logger) {
+        public ApiClient(String baseUrl, int timeoutMs, Logger logger, BalanceCacheManager cache) {
             this.baseUrl = baseUrl.endsWith("/") ? baseUrl : (baseUrl + "/");
             this.timeoutMs = timeoutMs;
             this.log = logger;
+            this.cache = cache;
+            this.rateLimiter = new RateLimiter(500); // 0.5 seconds between requests
         }
     
         public CardTransferResult transferByCard(String fromCard, String toCard, double amount) {
             String endpoint = baseUrl + "api/card/pay";
             String body = "{\"fromCard\":\"" + esc(fromCard) + "\",\"toCard\":\"" + esc(toCard) + "\",\"amount\":" + amount + "}";
             try {
+                rateLimiter.acquire();
                 String resp = postJson(endpoint, body);
                 boolean ok = parseBoolean(resp, "success");
                 String tx = parseString(resp, "txId");
@@ -1025,18 +1063,35 @@ public class CoinCardPlugin extends JavaPlugin {
         }
         
         public CardInfoResult getCardInfo(String cardCode) {
+            Double cached = cache.getBalance(cardCode);
+            if (cached != null) {
+                return new CardInfoResult(true, cached, null);
+            }
+            
             String endpoint = baseUrl + "api/card/info";
             String body = "{\"cardCode\":\"" + esc(cardCode) + "\"}";
             try {
+                rateLimiter.acquire();
                 String resp = postJson(endpoint, body);
                 boolean success = parseBoolean(resp, "success");
                 if (!success) return new CardInfoResult(false, null, parseString(resp, "error"));
                 
                 Double coins = parseDouble(resp, "coins");
                 if (coins == null) coins = parseDouble(resp, "sats");
-                return new CardInfoResult(true, coins, null);
+                
+                if (coins != null) {
+                    double truncated = DecimalUtil.truncate(coins, 8);
+                    cache.setBalance(cardCode, truncated);
+                    return new CardInfoResult(true, truncated, null);
+                }
+                
+                return new CardInfoResult(true, null, null);
             } catch (IOException e) {
                 log.warning("HTTP error getting card info: " + e.getMessage());
+                Double cachedBalance = cache.getBalance(cardCode);
+                if (cachedBalance != null) {
+                    return new CardInfoResult(true, cachedBalance, "Using cached balance (API unavailable)");
+                }
                 return new CardInfoResult(false, null, "HTTP_ERROR");
             }
         }
@@ -1079,7 +1134,6 @@ public class CoinCardPlugin extends JavaPlugin {
             }
         }
     
-        // Simple JSON parsing methods
         private boolean parseBoolean(String json, String key) {
             String k = "\"" + key + "\"";
             int i = json.indexOf(k);
@@ -1128,24 +1182,57 @@ public class CoinCardPlugin extends JavaPlugin {
             if (s == null) return "";
             return s.replace("\\", "\\\\").replace("\"", "\\\"");
         }
+        
+        private static class RateLimiter {
+            private final long minIntervalMs;
+            private final AtomicLong lastRequestTime = new AtomicLong(0);
+            
+            RateLimiter(long minIntervalMs) {
+                this.minIntervalMs = minIntervalMs;
+            }
+            
+            void acquire() {
+                long now = System.currentTimeMillis();
+                long last = lastRequestTime.get();
+                long waitTime = minIntervalMs - (now - last);
+                
+                if (waitTime > 0) {
+                    try {
+                        Thread.sleep(waitTime);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+                
+                lastRequestTime.set(System.currentTimeMillis());
+            }
+        }
     }
     
-    /**
-     * CoinPlaceholderExpansion - Placeholder %coin_user% for PlaceholderAPI
-     * Updates every 2 seconds with the player's card balance
-     */
     public static class CoinPlaceholderExpansion extends PlaceholderExpansion {
         private final CoinCardPlugin plugin;
         private ApiClient api;
         private UserStore users;
+        private BalanceCacheManager cache;
         private final Map<UUID, Double> balanceCache = new ConcurrentHashMap<>();
         private final Map<UUID, Long> lastUpdate = new ConcurrentHashMap<>();
-        private final long CACHE_TTL_MS = 2000; // 2 seconds
+        private final long CACHE_TTL_MS = 30000; // 30 seconds
+        private int updateTaskId = -1;
         
-        public CoinPlaceholderExpansion(CoinCardPlugin plugin, ApiClient api, UserStore users) {
+        public CoinPlaceholderExpansion(CoinCardPlugin plugin, ApiClient api, UserStore users, BalanceCacheManager cache) {
             this.plugin = plugin;
             this.api = api;
             this.users = users;
+            this.cache = cache;
+            startPeriodicUpdate();
+        }
+        
+        private void startPeriodicUpdate() {
+            updateTaskId = Bukkit.getScheduler().scheduleSyncRepeatingTask(plugin, () -> {
+                for (Player player : Bukkit.getOnlinePlayers()) {
+                    updateBalanceAsync(player.getUniqueId());
+                }
+            }, 100L, 100L); // Update every 5 seconds (100 ticks = 5 seconds)
         }
         
         public void setApi(ApiClient api) { this.api = api; }
@@ -1174,7 +1261,6 @@ public class CoinCardPlugin extends JavaPlugin {
             UUID uuid = player.getUniqueId();
             long now = System.currentTimeMillis();
             
-            // Check cache
             Long last = lastUpdate.get(uuid);
             Double cached = balanceCache.get(uuid);
             
@@ -1182,15 +1268,18 @@ public class CoinCardPlugin extends JavaPlugin {
                 return DecimalUtil.formatFull(cached);
             }
             
-            // Update asynchronously
-            updateBalanceAsync(uuid);
+            Double diskCached = cache.getBalance(users.getCard(uuid));
+            if (diskCached != null) {
+                balanceCache.put(uuid, diskCached);
+                lastUpdate.put(uuid, now);
+                return DecimalUtil.formatFull(diskCached);
+            }
             
-            // Return cached value or loading indicator
-            return cached != null ? DecimalUtil.formatFull(cached) : "...";
+            return cached != null ? DecimalUtil.formatFull(cached) : "0";
         }
         
         private void updateBalanceAsync(UUID uuid) {
-            Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
+            plugin.getAsyncExecutor().submit(() -> {
                 String card = users.getCard(uuid);
                 if (card == null || card.isEmpty()) {
                     balanceCache.put(uuid, 0.0);
@@ -1198,20 +1287,37 @@ public class CoinCardPlugin extends JavaPlugin {
                     return;
                 }
                 
+                Double cached = cache.getBalance(card);
+                if (cached != null) {
+                    balanceCache.put(uuid, cached);
+                    lastUpdate.put(uuid, System.currentTimeMillis());
+                    return;
+                }
+                
                 ApiClient.CardInfoResult result = api.getCardInfo(card);
                 if (result.success && result.coins != null) {
-                    balanceCache.put(uuid, result.coins);
+                    double truncated = DecimalUtil.truncate(result.coins, 8);
+                    balanceCache.put(uuid, truncated);
+                    cache.setBalance(card, truncated);
                 } else {
-                    balanceCache.put(uuid, 0.0);
+                    Double oldCache = cache.getBalance(card);
+                    if (oldCache != null) {
+                        balanceCache.put(uuid, oldCache);
+                    } else {
+                        balanceCache.put(uuid, 0.0);
+                    }
                 }
                 lastUpdate.put(uuid, System.currentTimeMillis());
             });
         }
+        
+        public void shutdown() {
+            if (updateTaskId != -1) {
+                Bukkit.getScheduler().cancelTask(updateTaskId);
+            }
+        }
     }
     
-    /**
-     * PayCommand - /pay command
-     */
     public static class PayCommand implements CommandExecutor {
         private final CoinCardPlugin plugin;
         private final UserStore users;
@@ -1219,6 +1325,7 @@ public class CoinCardPlugin extends JavaPlugin {
         private QueueService queue;
         private CooldownManager cooldowns;
         private ConfigManager cfg;
+        private BalanceCacheManager cache;
         
         private static final String YELLOW = ChatColor.YELLOW.toString();
         private static final String GREEN = ChatColor.GREEN.toString();
@@ -1226,13 +1333,15 @@ public class CoinCardPlugin extends JavaPlugin {
         private static final String AQUA = ChatColor.AQUA.toString();
         
         public PayCommand(CoinCardPlugin plugin, UserStore users, ApiClient api,
-                         QueueService queue, CooldownManager cooldowns, ConfigManager cfg) {
+                         QueueService queue, CooldownManager cooldowns, ConfigManager cfg,
+                         BalanceCacheManager cache) {
             this.plugin = plugin;
             this.users = users;
             this.api = api;
             this.queue = queue;
             this.cooldowns = cooldowns;
             this.cfg = cfg;
+            this.cache = cache;
         }
         
         public void setApi(ApiClient api) { this.api = api; }
@@ -1304,11 +1413,14 @@ public class CoinCardPlugin extends JavaPlugin {
             final String fToCard = toCard;
             final String fTargetName = args[0];
             
-            Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
+            plugin.getAsyncExecutor().submit(() -> {
                 ApiClient.CardTransferResult r = api.transferByCard(fFromCard, fToCard, fAmount);
                 
                 Bukkit.getScheduler().runTask(plugin, () -> {
                     if (r.success) {
+                        cache.setBalance(fFromCard, cache.getBalanceOrDefault(fFromCard, 0) - fAmount);
+                        cache.setBalance(fToCard, cache.getBalanceOrDefault(fToCard, 0) + fAmount);
+                        
                         p.sendMessage(GREEN + "You sent " + YELLOW + DecimalUtil.formatFull(fAmount) +
                                 GREEN + " to " + YELLOW + fTargetName + GREEN +
                                 ". Transaction: " + AQUA + (r.txId != null ? r.txId : "-"));
@@ -1332,22 +1444,21 @@ public class CoinCardPlugin extends JavaPlugin {
         }
     }
     
-    /**
-     * BalanceCommand - /balance and /bal commands
-     */
     public static class BalanceCommand implements CommandExecutor {
         private final CoinCardPlugin plugin;
         private UserStore users;
         private ApiClient api;
+        private BalanceCacheManager cache;
         
         private static final String YELLOW = ChatColor.YELLOW.toString();
         private static final String GREEN = ChatColor.GREEN.toString();
         private static final String RED = ChatColor.RED.toString();
         
-        public BalanceCommand(CoinCardPlugin plugin, UserStore users, ApiClient api) {
+        public BalanceCommand(CoinCardPlugin plugin, UserStore users, ApiClient api, BalanceCacheManager cache) {
             this.plugin = plugin;
             this.users = users;
             this.api = api;
+            this.cache = cache;
         }
         
         public void setUsers(UserStore users) { this.users = users; }
@@ -1356,7 +1467,6 @@ public class CoinCardPlugin extends JavaPlugin {
         @Override
         public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
             if (args.length == 0) {
-                // Check own balance
                 if (!(sender instanceof Player)) {
                     sender.sendMessage(RED + "Please specify a player from console: /balance <player>");
                     return true;
@@ -1366,7 +1476,6 @@ public class CoinCardPlugin extends JavaPlugin {
                 checkBalance(p, p.getUniqueId(), p.getName());
                 
             } else {
-                // Check another player's balance
                 if (!sender.hasPermission("coin.admin")) {
                     sender.sendMessage(RED + "You don't have permission to check other players!");
                     return true;
@@ -1397,13 +1506,19 @@ public class CoinCardPlugin extends JavaPlugin {
                 return;
             }
             
-            Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
+            Double cached = cache.getBalance(card);
+            if (cached != null) {
+                sender.sendMessage(GREEN + name + "'s balance: " + YELLOW + DecimalUtil.formatFull(cached));
+                return;
+            }
+            
+            // Async fetch
+            plugin.getAsyncExecutor().submit(() -> {
                 ApiClient.CardInfoResult result = api.getCardInfo(card);
                 
                 Bukkit.getScheduler().runTask(plugin, () -> {
                     if (result.success && result.coins != null) {
-                        sender.sendMessage(GREEN + name + "'s balance: " + YELLOW + 
-                                DecimalUtil.formatFull(result.coins));
+                        sender.sendMessage(GREEN + name + "'s balance: " + YELLOW + DecimalUtil.formatFull(result.coins));
                     } else {
                         sender.sendMessage(RED + "Failed to check balance: " + 
                                 (result.error != null ? result.error : "Unknown error"));
@@ -1413,18 +1528,17 @@ public class CoinCardPlugin extends JavaPlugin {
         }
     }
     
-    /**
-     * BalTopCommand - /baltop command
-     */
     public static class BalTopCommand implements CommandExecutor {
         private final CoinCardPlugin plugin;
         private UserStore users;
         private ApiClient api;
+        private BalanceCacheManager cache;
         private final Map<Integer, List<BalanceEntry>> pageCache = new ConcurrentHashMap<>();
         private BigDecimal totalServerBalance = BigDecimal.ZERO;
         private int totalPlayers = 0;
         private long lastCacheUpdate = 0;
-        private boolean isUpdating = false;
+        private volatile boolean isUpdating = false;
+        private final Object updateLock = new Object();
         
         private static final String YELLOW = ChatColor.YELLOW.toString();
         private static final String GOLD = ChatColor.GOLD.toString();
@@ -1447,14 +1561,15 @@ public class CoinCardPlugin extends JavaPlugin {
             
             @Override
             public int compareTo(BalanceEntry o) {
-                return o.balance.compareTo(this.balance); // Descending order
+                return o.balance.compareTo(this.balance);
             }
         }
         
-        public BalTopCommand(CoinCardPlugin plugin, UserStore users, ApiClient api) {
+        public BalTopCommand(CoinCardPlugin plugin, UserStore users, ApiClient api, BalanceCacheManager cache) {
             this.plugin = plugin;
             this.users = users;
             this.api = api;
+            this.cache = cache;
         }
         
         public void setUsers(UserStore users) { this.users = users; }
@@ -1473,8 +1588,7 @@ public class CoinCardPlugin extends JavaPlugin {
                 }
             }
             
-            // Check if we need to update cache
-            if (System.currentTimeMillis() - lastCacheUpdate > 60000 || pageCache.isEmpty()) { // Update every minute
+            if (System.currentTimeMillis() - lastCacheUpdate > 300000 || pageCache.isEmpty()) {
                 if (!isUpdating) {
                     updateBaltopCache(sender, page);
                 } else {
@@ -1488,68 +1602,41 @@ public class CoinCardPlugin extends JavaPlugin {
         }
         
         private void updateBaltopCache(CommandSender requester, int requestedPage) {
-            isUpdating = true;
-            requester.sendMessage(YELLOW + "Scanning balances... This may take a moment.");
-            
-            Set<UUID> allUsers = users.getAllUsers();
-            List<BalanceEntry> entries = Collections.synchronizedList(new ArrayList<>());
-            AtomicInteger processed = new AtomicInteger(0);
-            
-            // Count valid users first and store in a final variable
-            List<UUID> validUsers = new ArrayList<>();
-            for (UUID uuid : allUsers) {
-                String card = users.getCard(uuid);
-                String name = users.getNick(uuid);
-                if (card != null && !card.isEmpty() && name != null && !name.isEmpty()) {
-                    validUsers.add(uuid);
-                }
+            synchronized (updateLock) {
+                if (isUpdating) return;
+                isUpdating = true;
             }
             
-            final int totalToProcess = validUsers.size();
+            requester.sendMessage(YELLOW + "Loading balances from cache...");
             
-            if (totalToProcess == 0) {
-                finishUpdate(entries, requestedPage, requester);
-                return;
-            }
-            
-            for (UUID uuid : validUsers) {
-                final String card = users.getCard(uuid);
-                final String name = users.getNick(uuid);
+            plugin.getAsyncExecutor().submit(() -> {
+                Set<UUID> allUsers = users.getAllUsers();
+                List<BalanceEntry> entries = Collections.synchronizedList(new ArrayList<>());
                 
-                // Process with delay between each request
-                long delay = processed.get() * 2L; // 2 ticks = 100ms delay between requests
-                Bukkit.getScheduler().runTaskLater(plugin, () -> {
-                    api.getCardInfo(card, new ApiClient.CardInfoResultCallback() {
-                        @Override
-                        public void onResult(ApiClient.CardInfoResult result) {
-                            if (result.success && result.coins != null) {
-                                BigDecimal balance = BigDecimal.valueOf(result.coins);
-                                entries.add(new BalanceEntry(name, balance, card));
-                            }
-                            
-                            int current = processed.incrementAndGet();
-                            if (current >= totalToProcess) {
-                                // All processed, sort and create cache
-                                finishUpdate(entries, requestedPage, requester);
-                            }
+                for (UUID uuid : allUsers) {
+                    String card = users.getCard(uuid);
+                    String name = users.getNick(uuid);
+                    if (card != null && !card.isEmpty() && name != null && !name.isEmpty()) {
+                        Double balance = cache.getBalance(card);
+                        if (balance != null) {
+                            entries.add(new BalanceEntry(name, BigDecimal.valueOf(balance), card));
                         }
-                    });
-                }, delay);
-            }
+                    }
+                }
+                
+                finishUpdate(entries, requestedPage, requester);
+            });
         }
         
         private void finishUpdate(List<BalanceEntry> entries, int requestedPage, CommandSender requester) {
-            // Sort entries
             Collections.sort(entries);
             
-            // Calculate total server balance
             BigDecimal total = BigDecimal.ZERO;
             for (BalanceEntry entry : entries) {
                 total = total.add(entry.balance);
             }
             totalServerBalance = total;
             
-            // Create page cache (10 per page)
             pageCache.clear();
             int page = 1;
             List<BalanceEntry> currentPage = new ArrayList<>();
@@ -1566,8 +1653,7 @@ public class CoinCardPlugin extends JavaPlugin {
             lastCacheUpdate = System.currentTimeMillis();
             isUpdating = false;
             
-            // Display requested page
-            displayBaltop(requester, requestedPage);
+            Bukkit.getScheduler().runTask(plugin, () -> displayBaltop(requester, requestedPage));
         }
         
         private void displayBaltop(CommandSender sender, int page) {
@@ -1625,9 +1711,6 @@ public class CoinCardPlugin extends JavaPlugin {
         }
     }
     
-    /**
-     * CoinCommand - /coin command (now based only on Card)
-     */
     public static class CoinCommand implements CommandExecutor, TabCompleter {
         private final CoinCardPlugin plugin;
         private final UserStore users;
@@ -1636,8 +1719,8 @@ public class CoinCardPlugin extends JavaPlugin {
         private QueueService queue;
         private CooldownManager cooldowns;
         private ConfigManager cfg;
+        private BalanceCacheManager cache;
         
-        // Color constants for easier maintenance
         private static final String YELLOW = ChatColor.YELLOW.toString();
         private static final String GRAY = ChatColor.GRAY.toString();
         private static final String GREEN = ChatColor.GREEN.toString();
@@ -1647,7 +1730,7 @@ public class CoinCardPlugin extends JavaPlugin {
     
         public CoinCommand(CoinCardPlugin plugin, UserStore users, ApiClient api,
                           QueueService queue, CooldownManager cooldowns,
-                          Economy eco, ConfigManager cfg) {
+                          Economy eco, ConfigManager cfg, BalanceCacheManager cache) {
             this.plugin = plugin;
             this.users = users;
             this.api = api;
@@ -1655,6 +1738,7 @@ public class CoinCardPlugin extends JavaPlugin {
             this.cooldowns = cooldowns;
             this.eco = eco;
             this.cfg = cfg;
+            this.cache = cache;
         }
     
         public void setApi(ApiClient api) { this.api = api; }
@@ -1662,42 +1746,19 @@ public class CoinCardPlugin extends JavaPlugin {
         public void setCooldowns(CooldownManager cooldowns) { this.cooldowns = cooldowns; }
         public void setConfig(ConfigManager cfg) { this.cfg = cfg; }
         
-        /**
-         * Gets a player's card by nickname (works for offline players)
-         * @param nick Player's nickname
-         * @return Card string or null if not found
-         */
         private String getCardByNick(String nick) {
-            // Try to find online player first
             Player onlinePlayer = Bukkit.getPlayerExact(nick);
             if (onlinePlayer != null) {
                 String card = users.getCard(onlinePlayer.getUniqueId());
                 if (card != null) return card;
             }
             
-            // Try to find in database by nickname
             UUID uuid = users.findUUIDByNick(nick);
             if (uuid != null) {
                 return users.getCard(uuid);
             }
             
             return null;
-        }
-        
-        /**
-         * Gets a player's name by card (for display purposes)
-         * @param card Card string
-         * @return Player name or "Unknown"
-         */
-        private String getPlayerNameByCard(String card) {
-            if (card == null) return "Unknown";
-            
-            // This is a simple implementation - in a real scenario you might want to cache this
-            if (card.equals(cfg.getServerCard())) {
-                return "Server";
-            }
-            
-            return "Player";
         }
     
         @Override
@@ -1800,15 +1861,12 @@ public class CoinCardPlugin extends JavaPlugin {
                     
                 case "balance":
                 case "bal":
-                    // Redirecionar para o comando de balance
                     if (s instanceof Player) {
                         Player player = (Player) s;
                         if (a.length > 1) {
-                            // /coin balance <player>
                             String[] balanceArgs = {a[1]};
                             plugin.getCommand("balance").execute(s, null, balanceArgs);
                         } else {
-                            // /coin balance
                             plugin.getCommand("balance").execute(s, null, new String[0]);
                         }
                     } else {
@@ -1817,7 +1875,6 @@ public class CoinCardPlugin extends JavaPlugin {
                     return true;
                     
                 case "baltop":
-                    // Redirecionar para o comando baltop
                     if (a.length > 1) {
                         String[] baltopArgs = {a[1]};
                         plugin.getCommand("baltop").execute(s, null, baltopArgs);
@@ -1850,7 +1907,6 @@ public class CoinCardPlugin extends JavaPlugin {
                 return; 
             }
             
-            // Get target card (works for offline players!)
             String toCard = getCardByNick(targetName);
             if (toCard == null) {
                 p.sendMessage(RED + "Target player doesn't have a card set or doesn't exist.");
@@ -1874,16 +1930,18 @@ public class CoinCardPlugin extends JavaPlugin {
             final String fToCard = toCard;
             final String fTargetName = targetName;
     
-            Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
+            plugin.getAsyncExecutor().submit(() -> {
                 ApiClient.CardTransferResult r = api.transferByCard(fFromCard, fToCard, fAmount);
                 
                 Bukkit.getScheduler().runTask(plugin, () -> {
                     if (r.success) {
+                        cache.setBalance(fFromCard, cache.getBalanceOrDefault(fFromCard, 0) - fAmount);
+                        cache.setBalance(fToCard, cache.getBalanceOrDefault(fToCard, 0) + fAmount);
+                        
                         p.sendMessage(GREEN + "You sent " + YELLOW + DecimalUtil.formatFull(fAmount) + 
                                      GREEN + " to " + YELLOW + fTargetName + GREEN + 
                                      ". Transaction: " + AQUA + (r.txId != null ? r.txId : "-"));
                         
-                        // Try to notify if player is online
                         Player onlineTarget = Bukkit.getPlayerExact(fTargetName);
                         if (onlineTarget != null && onlineTarget.isOnline()) {
                             onlineTarget.sendMessage(GREEN + "You received " + YELLOW + DecimalUtil.formatFull(fAmount) + 
@@ -1948,7 +2006,7 @@ public class CoinCardPlugin extends JavaPlugin {
             final String fServerCard = serverCard;
     
             queue.enqueue(() -> {
-                Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
+                plugin.getAsyncExecutor().submit(() -> {
                     ApiClient.CardTransferResult r = api.transferByCard(fFromCard, fServerCard, fCoins);
                     
                     Bukkit.getScheduler().runTask(plugin, () -> {
@@ -1959,6 +2017,9 @@ public class CoinCardPlugin extends JavaPlugin {
     
                         eco.withdrawPlayer(serverAcc, fVaultToPay);
                         eco.depositPlayer(p, fVaultToPay);
+                        
+                        cache.setBalance(fFromCard, cache.getBalanceOrDefault(fFromCard, 0) - fCoins);
+                        cache.setBalance(fServerCard, cache.getBalanceOrDefault(fServerCard, 0) + fCoins);
     
                         String tx = (r.txId != null ? r.txId : "-");
                         p.sendMessage(GREEN + "Bought " + YELLOW + DecimalUtil.formatFull(fCoins) + 
@@ -2012,7 +2073,7 @@ public class CoinCardPlugin extends JavaPlugin {
             final String fServerCard = serverCard;
     
             queue.enqueue(() -> {
-                Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
+                plugin.getAsyncExecutor().submit(() -> {
                     ApiClient.CardTransferResult r = api.transferByCard(fServerCard, fToCard, fCoins);
                     
                     Bukkit.getScheduler().runTask(plugin, () -> {
@@ -2024,6 +2085,9 @@ public class CoinCardPlugin extends JavaPlugin {
                         eco.withdrawPlayer(p, fVault);
                         OfflinePlayer serverAcc = plugin.getServerVaultAccount();
                         if (serverAcc != null) eco.depositPlayer(serverAcc, fVault);
+                        
+                        cache.setBalance(fServerCard, cache.getBalanceOrDefault(fServerCard, 0) - fCoins);
+                        cache.setBalance(fToCard, cache.getBalanceOrDefault(fToCard, 0) + fCoins);
     
                         String tx = (r.txId != null ? r.txId : "-");
                         p.sendMessage(GREEN + "Sold " + YELLOW + DecimalUtil.formatFull(fVault) + 
@@ -2049,7 +2113,6 @@ public class CoinCardPlugin extends JavaPlugin {
                 return;
             }
             
-            // Get target card (works for offline players!)
             String toCard = getCardByNick(targetName);
             if (toCard == null) {
                 s.sendMessage(RED + "Target player doesn't have a card set or doesn't exist.");
@@ -2074,11 +2137,14 @@ public class CoinCardPlugin extends JavaPlugin {
             final String fTargetName = targetName;
     
             queue.enqueue(() -> {
-                Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
+                plugin.getAsyncExecutor().submit(() -> {
                     ApiClient.CardTransferResult r = api.transferByCard(fServerCard, fToCard, fAmount);
                     
                     Bukkit.getScheduler().runTask(plugin, () -> {
                         if (r.success) {
+                            cache.setBalance(fServerCard, cache.getBalanceOrDefault(fServerCard, 0) - fAmount);
+                            cache.setBalance(fToCard, cache.getBalanceOrDefault(fToCard, 0) + fAmount);
+                            
                             String tx = (r.txId != null ? r.txId : "-");
                             s.sendMessage(GREEN + "Server sent " + YELLOW + DecimalUtil.formatFull(fAmount) + 
                                          GREEN + " to " + YELLOW + fTargetName + GREEN + 
@@ -2106,7 +2172,6 @@ public class CoinCardPlugin extends JavaPlugin {
             List<String> out = new ArrayList<>();
             
             if (a.length == 1) {
-                // First argument: subcommands
                 out.addAll(Arrays.asList("card", "pay", "buy", "sell", "balance", "bal", "baltop"));
                 if (s.hasPermission("coin.admin")) {
                     out.addAll(Arrays.asList("reload", "server"));
@@ -2115,10 +2180,7 @@ public class CoinCardPlugin extends JavaPlugin {
             }
             
             if (a.length == 2) {
-                // Second argument
                 if (a[0].equalsIgnoreCase("pay") || a[0].equalsIgnoreCase("server") && a.length == 2) {
-                    // For tab completion, we can only show online players
-                    // But the command will work with offline players too
                     out.addAll(Bukkit.getOnlinePlayers().stream()
                                      .map(Player::getName)
                                      .collect(Collectors.toList()));
@@ -2126,7 +2188,6 @@ public class CoinCardPlugin extends JavaPlugin {
                 }
                 
                 if (a[0].equalsIgnoreCase("balance") || a[0].equalsIgnoreCase("bal")) {
-                    // Suggest players for balance command
                     out.addAll(Bukkit.getOnlinePlayers().stream()
                                      .map(Player::getName)
                                      .collect(Collectors.toList()));
@@ -2135,9 +2196,7 @@ public class CoinCardPlugin extends JavaPlugin {
             }
             
             if (a.length == 3) {
-                // Third argument
                 if (a[0].equalsIgnoreCase("server") && a[1].equalsIgnoreCase("pay") && s.hasPermission("coin.admin")) {
-                    // /coin server pay <player>
                     out.addAll(Bukkit.getOnlinePlayers().stream()
                                      .map(Player::getName)
                                      .collect(Collectors.toList()));
