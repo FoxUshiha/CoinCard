@@ -35,7 +35,7 @@ import java.security.SecureRandom;
 import java.security.spec.KeySpec;
 import java.util.*;
 import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
@@ -54,10 +54,10 @@ public class CoinCardPlugin extends JavaPlugin {
     private ConfigManager config;
     private UserStore users;
     private ApiClient apiClient;
-    private QueueService queue;
-    private CooldownManager cooldowns;
-    private CoinPlaceholderExpansion placeholderExpansion;
+    private AsyncQueueProcessor queueProcessor;
     private BalanceCacheManager balanceCache;
+    private CoinPlaceholderExpansion placeholderExpansion;
+    private BaltopUpdater baltopUpdater;
     
     // Command reference
     private CoinCommand coinCommand;
@@ -124,8 +124,11 @@ public class CoinCardPlugin extends JavaPlugin {
         balanceCache.loadFromDiskAsync();
         
         apiClient = new ApiClient(config.getApiBase(), config.getTimeoutMs(), getLogger(), balanceCache);
-        queue = new QueueService(this, config.getQueueIntervalTicks());
-        cooldowns = new CooldownManager(config.getPerUserCooldownMs());
+        
+        // Initialize async queue processor with delay from config (default 1010ms)
+        long processDelayMs = config.getQueueProcessDelayMs();
+        queueProcessor = new AsyncQueueProcessor(processDelayMs);
+        queueProcessor.start();
         
         // Initialize API
         api = new CoinCardAPIImpl(this);
@@ -134,8 +137,8 @@ public class CoinCardPlugin extends JavaPlugin {
         getServer().getServicesManager().register(CoinCardAPI.class, api, this, ServicePriority.Normal);
         
         // Register commands
-        coinCommand = new CoinCommand(this, users, apiClient, queue, cooldowns, economy, config, balanceCache);
-        payCommand = new PayCommand(this, users, apiClient, queue, cooldowns, config, balanceCache);
+        coinCommand = new CoinCommand(this, users, apiClient, queueProcessor, economy, config, balanceCache);
+        payCommand = new PayCommand(this, users, apiClient, queueProcessor, config, balanceCache);
         balanceCommand = new BalanceCommand(this, users, apiClient, balanceCache);
         balTopCommand = new BalTopCommand(this, users, apiClient, balanceCache);
         
@@ -146,11 +149,15 @@ public class CoinCardPlugin extends JavaPlugin {
         Objects.requireNonNull(getCommand("c")).setTabCompleter(coinCommand);
         
         Objects.requireNonNull(getCommand("pay")).setExecutor(payCommand);
+        Objects.requireNonNull(getCommand("pay")).setTabCompleter(payCommand);
         
         Objects.requireNonNull(getCommand("balance")).setExecutor(balanceCommand);
+        Objects.requireNonNull(getCommand("balance")).setTabCompleter(balanceCommand);
         Objects.requireNonNull(getCommand("bal")).setExecutor(balanceCommand);
+        Objects.requireNonNull(getCommand("bal")).setTabCompleter(balanceCommand);
         
         Objects.requireNonNull(getCommand("baltop")).setExecutor(balTopCommand);
+        Objects.requireNonNull(getCommand("baltop")).setTabCompleter(balTopCommand);
         
         // Register placeholder if PlaceholderAPI is available
         if (Bukkit.getPluginManager().getPlugin("PlaceholderAPI") != null) {
@@ -158,6 +165,10 @@ public class CoinCardPlugin extends JavaPlugin {
             placeholderExpansion.register();
             getLogger().info("Placeholder %coin_user% registered with 30s cache.");
         }
+        
+        // Start baltop updater (every 1 minute)
+        baltopUpdater = new BaltopUpdater(this, users, apiClient, balanceCache);
+        baltopUpdater.start();
         
         getLogger().info("CoinCard v" + getDescription().getVersion() + " enabled.");
         getLogger().info("Commands: /coin, /c, /pay, /balance, /bal, /baltop");
@@ -178,10 +189,11 @@ public class CoinCardPlugin extends JavaPlugin {
             }
         }
         
+        if (queueProcessor != null) queueProcessor.shutdown();
         if (balanceCache != null) balanceCache.saveToDiskAsync();
         if (users != null) users.saveAsync();
-        if (queue != null) queue.shutdown();
         if (placeholderExpansion != null) placeholderExpansion.shutdown();
+        if (baltopUpdater != null) baltopUpdater.shutdown();
         if (api instanceof CoinCardAPIImpl) {
             ((CoinCardAPIImpl) api).shutdown();
         }
@@ -238,23 +250,19 @@ public class CoinCardPlugin extends JavaPlugin {
         users.loadAsync(); // Reload async
         
         this.apiClient = new ApiClient(config.getApiBase(), config.getTimeoutMs(), getLogger(), balanceCache);
-        this.cooldowns = new CooldownManager(config.getPerUserCooldownMs());
         
-        if (queue != null) queue.shutdown();
-        queue = new QueueService(this, config.getQueueIntervalTicks());
+        if (queueProcessor != null) queueProcessor.setDelayMs(config.getQueueProcessDelayMs());
         
         if (coinCommand != null) {
             coinCommand.setConfig(config);
             coinCommand.setApi(apiClient);
-            coinCommand.setQueue(queue);
-            coinCommand.setCooldowns(cooldowns);
+            coinCommand.setQueue(queueProcessor);
         }
         
         if (payCommand != null) {
             payCommand.setConfig(config);
             payCommand.setApi(apiClient);
-            payCommand.setQueue(queue);
-            payCommand.setCooldowns(cooldowns);
+            payCommand.setQueue(queueProcessor);
         }
         
         if (balanceCommand != null) {
@@ -273,7 +281,11 @@ public class CoinCardPlugin extends JavaPlugin {
         }
         
         if (api instanceof CoinCardAPIImpl) {
-            ((CoinCardAPIImpl) api).updateComponents(apiClient, users, config, queue);
+            ((CoinCardAPIImpl) api).updateComponents(apiClient, users, config, queueProcessor);
+        }
+        
+        if (baltopUpdater != null) {
+            baltopUpdater.updateComponents(users, apiClient);
         }
     }
     
@@ -293,8 +305,7 @@ public class CoinCardPlugin extends JavaPlugin {
     public Economy getEconomy() { return economy; }
     public ConfigManager getCoinConfig() { return config; }
     public ApiClient getApiClient() { return apiClient; }
-    public QueueService getQueue() { return queue; }
-    public CooldownManager getCooldowns() { return cooldowns; }
+    public AsyncQueueProcessor getQueueProcessor() { return queueProcessor; }
     public UserStore getUserStore() { return users; }
     public BalanceCacheManager getBalanceCache() { return balanceCache; }
     public ExecutorService getAsyncExecutor() { return asyncExecutor; }
@@ -349,7 +360,7 @@ public class CoinCardPlugin extends JavaPlugin {
         private ApiClient api;
         private UserStore users;
         private ConfigManager config;
-        private QueueService queue;
+        private AsyncQueueProcessor queue;
         private final Map<String, List<BalanceListener>> balanceListeners = new ConcurrentHashMap<>();
         private final Map<String, Double> lastKnownBalance = new ConcurrentHashMap<>();
         
@@ -358,10 +369,10 @@ public class CoinCardPlugin extends JavaPlugin {
             this.api = plugin.apiClient;
             this.users = plugin.users;
             this.config = plugin.config;
-            this.queue = plugin.queue;
+            this.queue = plugin.queueProcessor;
         }
         
-        public void updateComponents(ApiClient api, UserStore users, ConfigManager config, QueueService queue) {
+        public void updateComponents(ApiClient api, UserStore users, ConfigManager config, AsyncQueueProcessor queue) {
             this.api = api;
             this.users = users;
             this.config = config;
@@ -416,8 +427,7 @@ public class CoinCardPlugin extends JavaPlugin {
                 
                 Bukkit.getScheduler().runTask(plugin, () -> {
                     if (result.success) {
-                        updateCachedBalance(fromCard, -fAmount);
-                        updateCachedBalance(toCard, fAmount);
+                        // Do NOT update cache here - cache only updated by API fetches
                         callback.onSuccess(result.txId, fAmount);
                     } else {
                         callback.onFailure("Transfer failed: " + (result.raw != null ? result.raw : "Unknown error"));
@@ -435,11 +445,7 @@ public class CoinCardPlugin extends JavaPlugin {
             final double fAmount = DecimalUtil.truncate(amount, 8);
             ApiClient.CardTransferResult result = api.transferByCard(fromCard, toCard, fAmount);
             
-            if (result.success) {
-                updateCachedBalance(fromCard, -fAmount);
-                updateCachedBalance(toCard, fAmount);
-            }
-            
+            // Do NOT update cache here - cache only updated by API fetches
             return result;
         }
         
@@ -533,14 +539,6 @@ public class CoinCardPlugin extends JavaPlugin {
             }
         }
         
-        private void updateCachedBalance(String card, double delta) {
-            double oldBalance = plugin.balanceCache.getBalanceOrDefault(card, 0.0);
-            double newBalance = DecimalUtil.truncate(oldBalance + delta, 8);
-            plugin.balanceCache.setBalance(card, newBalance);
-            lastKnownBalance.put(card, newBalance);
-            notifyBalanceChange(card, oldBalance, newBalance);
-        }
-        
         private void notifyBalanceChange(String card, double oldBalance, double newBalance) {
             List<BalanceListener> listeners = balanceListeners.get(card);
             if (listeners != null) {
@@ -570,7 +568,7 @@ public class CoinCardPlugin extends JavaPlugin {
         private final long CACHE_DURATION_MS = 30000; // 30 seconds
         private final Object saveLock = new Object();
         private volatile boolean dirty = false;
-        private BukkitTask saveTask; // Changed from ScheduledFuture<?> to BukkitTask
+        private BukkitTask saveTask;
         
         private static class CachedBalance implements Serializable {
             private static final long serialVersionUID = 1L;
@@ -590,7 +588,6 @@ public class CoinCardPlugin extends JavaPlugin {
         public BalanceCacheManager(CoinCardPlugin plugin) {
             this.plugin = plugin;
             this.cacheFile = new File(plugin.getDataFolder(), "balance_cache.dat");
-            // Schedule periodic save
             this.saveTask = Bukkit.getScheduler().runTaskTimerAsynchronously(plugin, this::saveIfDirty, 6000L, 6000L);
         }
         
@@ -710,6 +707,142 @@ public class CoinCardPlugin extends JavaPlugin {
         }
     }
     
+    // ==================== ASYNC QUEUE PROCESSOR ====================
+    
+    public static class AsyncQueueProcessor {
+        private final Queue<Runnable> tasks = new ConcurrentLinkedQueue<>();
+        private final AtomicBoolean running = new AtomicBoolean(false);
+        private Thread workerThread;
+        private volatile long delayMs;
+        
+        public AsyncQueueProcessor(long delayMs) {
+            this.delayMs = delayMs;
+        }
+        
+        public void start() {
+            if (running.getAndSet(true)) return;
+            workerThread = new Thread(() -> {
+                while (running.get()) {
+                    Runnable task = tasks.poll();
+                    if (task != null) {
+                        try {
+                            task.run();
+                        } catch (Exception e) {
+                            e.printStackTrace();
+                        }
+                        try {
+                            Thread.sleep(delayMs);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            break;
+                        }
+                    } else {
+                        try {
+                            Thread.sleep(50);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            break;
+                        }
+                    }
+                }
+            });
+            workerThread.setDaemon(true);
+            workerThread.start();
+        }
+        
+        public void enqueue(Runnable r) {
+            if (r != null) tasks.offer(r);
+        }
+        
+        public void setDelayMs(long delayMs) {
+            this.delayMs = delayMs;
+        }
+        
+        public void shutdown() {
+            running.set(false);
+            if (workerThread != null) {
+                workerThread.interrupt();
+            }
+            tasks.clear();
+        }
+    }
+    
+    // ==================== BALTOP UPDATER ====================
+    
+    public static class BaltopUpdater {
+        private final CoinCardPlugin plugin;
+        private UserStore users;
+        private ApiClient api;
+        private BalanceCacheManager cache;
+        private BukkitTask updateTask;
+        private final AtomicBoolean updating = new AtomicBoolean(false);
+        
+        public BaltopUpdater(CoinCardPlugin plugin, UserStore users, ApiClient api, BalanceCacheManager cache) {
+            this.plugin = plugin;
+            this.users = users;
+            this.api = api;
+            this.cache = cache;
+        }
+        
+        public void updateComponents(UserStore users, ApiClient api) {
+            this.users = users;
+            this.api = api;
+        }
+        
+        public void start() {
+            // Run every minute (1200 ticks)
+            updateTask = Bukkit.getScheduler().runTaskTimerAsynchronously(plugin, this::updateAllBalances, 1200L, 1200L);
+        }
+        
+        private void updateAllBalances() {
+            if (updating.getAndSet(true)) return;
+            
+            plugin.getAsyncExecutor().submit(() -> {
+                try {
+                    Set<UUID> allUsers = users.getAllUsers();
+                    if (allUsers.isEmpty()) {
+                        updating.set(false);
+                        return;
+                    }
+                    
+                    List<String> cardsToUpdate = new ArrayList<>();
+                    for (UUID uuid : allUsers) {
+                        String card = users.getCard(uuid);
+                        if (card != null && !card.isEmpty()) {
+                            cardsToUpdate.add(card);
+                        }
+                    }
+                    
+                    // Process each card with 100ms delay between requests
+                    for (String card : cardsToUpdate) {
+                        try {
+                            ApiClient.CardInfoResult result = api.getCardInfo(card);
+                            if (result.success && result.coins != null) {
+                                cache.setBalance(card, result.coins);
+                            }
+                            Thread.sleep(100);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            break;
+                        } catch (Exception e) {
+                            plugin.getLogger().warning("Error updating balance for card " + card + ": " + e.getMessage());
+                        }
+                    }
+                    
+                    plugin.getLogger().info("Baltop updated " + cardsToUpdate.size() + " card balances.");
+                } finally {
+                    updating.set(false);
+                }
+            });
+        }
+        
+        public void shutdown() {
+            if (updateTask != null) {
+                updateTask.cancel();
+            }
+        }
+    }
+    
     // ==================== INNER CLASSES ====================
     
     public static class ConfigManager {
@@ -719,7 +852,7 @@ public class CoinCardPlugin extends JavaPlugin {
         private final double sellCoinsPerVault;
         private final String apiBase;
         private final int queueIntervalTicks;
-        private final long perUserCooldownMs;
+        private final long queueProcessDelayMs;
         private final int timeoutMs;
     
         public ConfigManager(org.bukkit.configuration.file.FileConfiguration c) {
@@ -729,7 +862,7 @@ public class CoinCardPlugin extends JavaPlugin {
             this.sellCoinsPerVault = c.getDouble("Sell", 0.0D);
             this.apiBase = c.getString("API", "https://bank.foxsrv.net/");
             this.queueIntervalTicks = c.getInt("QueueIntervalTicks", 20);
-            this.perUserCooldownMs = c.getLong("PerUserCooldownMs", 1000L);
+            this.queueProcessDelayMs = c.getLong("QueueProcessDelayMs", 1010L);
             this.timeoutMs = c.getInt("TimeoutMs", 10000);
         }
     
@@ -739,7 +872,7 @@ public class CoinCardPlugin extends JavaPlugin {
         public double getSellCoinsPerVault() { return sellCoinsPerVault; }
         public String getApiBase() { return apiBase; }
         public int getQueueIntervalTicks() { return queueIntervalTicks; }
-        public long getPerUserCooldownMs() { return perUserCooldownMs; }
+        public long getQueueProcessDelayMs() { return queueProcessDelayMs; }
         public int getTimeoutMs() { return timeoutMs; }
     }
     
@@ -748,12 +881,11 @@ public class CoinCardPlugin extends JavaPlugin {
         private final File file;
         private final Map<UUID, UserData> data = new ConcurrentHashMap<>();
         private volatile boolean dirty = false;
-        private BukkitTask saveTask; // Changed from ScheduledFuture<?> to BukkitTask
+        private BukkitTask saveTask;
     
         public UserStore(CoinCardPlugin plugin) {
             this.plugin = plugin;
             this.file = new File(plugin.getDataFolder(), "users.dat");
-            // Schedule periodic save
             this.saveTask = Bukkit.getScheduler().runTaskTimerAsynchronously(plugin, this::saveIfDirty, 6000L, 6000L);
         }
         
@@ -905,7 +1037,6 @@ public class CoinCardPlugin extends JavaPlugin {
                 ud.card = card;
                 dirty = true;
             }
-            // Save async but we don't need to wait
             saveAsync();
         }
     
@@ -947,42 +1078,6 @@ public class CoinCardPlugin extends JavaPlugin {
             }
             saveAsync();
         }
-    }
-    
-    public static class CooldownManager {
-        private final long cooldownMs;
-        private final Map<UUID, Long> lastUse = new ConcurrentHashMap<>();
-    
-        public CooldownManager(long cooldownMs) {
-            this.cooldownMs = cooldownMs;
-        }
-    
-        public boolean checkAndStamp(UUID user) {
-            long now = System.currentTimeMillis();
-            Long last = lastUse.get(user);
-            if (last != null && (now - last) < cooldownMs) return false;
-            lastUse.put(user, now);
-            return true;
-        }
-    }
-    
-    public static class QueueService {
-        private final Queue<Runnable> tasks = new ConcurrentLinkedQueue<>();
-        private final int taskId;
-    
-        public QueueService(JavaPlugin plugin, int intervalTicks) {
-            this.taskId = Bukkit.getScheduler().scheduleSyncRepeatingTask(plugin, () -> {
-                Runnable r = tasks.poll();
-                if (r != null) {
-                    try { r.run(); } catch (Throwable t) { 
-                        plugin.getLogger().warning("Task error: " + t.getMessage()); 
-                    }
-                }
-            }, intervalTicks, intervalTicks);
-        }
-    
-        public void enqueue(Runnable r) { if (r != null) tasks.offer(r); }
-        public void shutdown() { Bukkit.getScheduler().cancelTask(taskId); tasks.clear(); }
     }
     
     public static class DecimalUtil {
@@ -1043,7 +1138,7 @@ public class CoinCardPlugin extends JavaPlugin {
             this.timeoutMs = timeoutMs;
             this.log = logger;
             this.cache = cache;
-            this.rateLimiter = new RateLimiter(500); // 0.5 seconds between requests
+            this.rateLimiter = new RateLimiter(500);
         }
     
         public CardTransferResult transferByCard(String fromCard, String toCard, double amount) {
@@ -1216,7 +1311,7 @@ public class CoinCardPlugin extends JavaPlugin {
         private BalanceCacheManager cache;
         private final Map<UUID, Double> balanceCache = new ConcurrentHashMap<>();
         private final Map<UUID, Long> lastUpdate = new ConcurrentHashMap<>();
-        private final long CACHE_TTL_MS = 30000; // 30 seconds
+        private final long CACHE_TTL_MS = 30000;
         private int updateTaskId = -1;
         
         public CoinPlaceholderExpansion(CoinCardPlugin plugin, ApiClient api, UserStore users, BalanceCacheManager cache) {
@@ -1232,7 +1327,7 @@ public class CoinCardPlugin extends JavaPlugin {
                 for (Player player : Bukkit.getOnlinePlayers()) {
                     updateBalanceAsync(player.getUniqueId());
                 }
-            }, 100L, 100L); // Update every 5 seconds (100 ticks = 5 seconds)
+            }, 100L, 100L);
         }
         
         public void setApi(ApiClient api) { this.api = api; }
@@ -1318,12 +1413,11 @@ public class CoinCardPlugin extends JavaPlugin {
         }
     }
     
-    public static class PayCommand implements CommandExecutor {
+    public static class PayCommand implements CommandExecutor, TabCompleter {
         private final CoinCardPlugin plugin;
         private final UserStore users;
         private ApiClient api;
-        private QueueService queue;
-        private CooldownManager cooldowns;
+        private AsyncQueueProcessor queue;
         private ConfigManager cfg;
         private BalanceCacheManager cache;
         
@@ -1333,20 +1427,17 @@ public class CoinCardPlugin extends JavaPlugin {
         private static final String AQUA = ChatColor.AQUA.toString();
         
         public PayCommand(CoinCardPlugin plugin, UserStore users, ApiClient api,
-                         QueueService queue, CooldownManager cooldowns, ConfigManager cfg,
-                         BalanceCacheManager cache) {
+                         AsyncQueueProcessor queue, ConfigManager cfg, BalanceCacheManager cache) {
             this.plugin = plugin;
             this.users = users;
             this.api = api;
             this.queue = queue;
-            this.cooldowns = cooldowns;
             this.cfg = cfg;
             this.cache = cache;
         }
         
         public void setApi(ApiClient api) { this.api = api; }
-        public void setQueue(QueueService queue) { this.queue = queue; }
-        public void setCooldowns(CooldownManager cooldowns) { this.cooldowns = cooldowns; }
+        public void setQueue(AsyncQueueProcessor queue) { this.queue = queue; }
         public void setConfig(ConfigManager cfg) { this.cfg = cfg; }
         
         private String getCardByNick(String nick) {
@@ -1378,11 +1469,6 @@ public class CoinCardPlugin extends JavaPlugin {
             
             Player p = (Player) sender;
             
-            if (!cooldowns.checkAndStamp(p.getUniqueId())) {
-                p.sendMessage(RED + "Please wait 1 second before next transaction.");
-                return true;
-            }
-            
             String fromCard = users.getCard(p.getUniqueId());
             if (fromCard == null || fromCard.isEmpty()) {
                 p.sendMessage(RED + "Set your Card first with /coin card <card>.");
@@ -1413,14 +1499,13 @@ public class CoinCardPlugin extends JavaPlugin {
             final String fToCard = toCard;
             final String fTargetName = args[0];
             
-            plugin.getAsyncExecutor().submit(() -> {
+            // Queue the transaction instead of executing immediately
+            queue.enqueue(() -> {
                 ApiClient.CardTransferResult r = api.transferByCard(fFromCard, fToCard, fAmount);
                 
                 Bukkit.getScheduler().runTask(plugin, () -> {
                     if (r.success) {
-                        cache.setBalance(fFromCard, cache.getBalanceOrDefault(fFromCard, 0) - fAmount);
-                        cache.setBalance(fToCard, cache.getBalanceOrDefault(fToCard, 0) + fAmount);
-                        
+                        // Do NOT update cache here - cache only updated by API fetches
                         p.sendMessage(GREEN + "You sent " + YELLOW + DecimalUtil.formatFull(fAmount) +
                                 GREEN + " to " + YELLOW + fTargetName + GREEN +
                                 ". Transaction: " + AQUA + (r.txId != null ? r.txId : "-"));
@@ -1442,9 +1527,17 @@ public class CoinCardPlugin extends JavaPlugin {
             
             return true;
         }
+        
+        @Override
+        public List<String> onTabComplete(CommandSender sender, Command command, String alias, String[] args) {
+            if (args.length == 1) {
+                return Bukkit.getOnlinePlayers().stream().map(Player::getName).collect(Collectors.toList());
+            }
+            return Collections.emptyList();
+        }
     }
     
-    public static class BalanceCommand implements CommandExecutor {
+    public static class BalanceCommand implements CommandExecutor, TabCompleter {
         private final CoinCardPlugin plugin;
         private UserStore users;
         private ApiClient api;
@@ -1526,9 +1619,17 @@ public class CoinCardPlugin extends JavaPlugin {
                 });
             });
         }
+        
+        @Override
+        public List<String> onTabComplete(CommandSender sender, Command command, String alias, String[] args) {
+            if (args.length == 1 && sender.hasPermission("coin.admin")) {
+                return Bukkit.getOnlinePlayers().stream().map(Player::getName).collect(Collectors.toList());
+            }
+            return Collections.emptyList();
+        }
     }
     
-    public static class BalTopCommand implements CommandExecutor {
+    public static class BalTopCommand implements CommandExecutor, TabCompleter {
         private final CoinCardPlugin plugin;
         private UserStore users;
         private ApiClient api;
@@ -1537,7 +1638,7 @@ public class CoinCardPlugin extends JavaPlugin {
         private BigDecimal totalServerBalance = BigDecimal.ZERO;
         private int totalPlayers = 0;
         private long lastCacheUpdate = 0;
-        private volatile boolean isUpdating = false;
+        private final AtomicBoolean isUpdating = new AtomicBoolean(false);
         private final Object updateLock = new Object();
         
         private static final String YELLOW = ChatColor.YELLOW.toString();
@@ -1588,72 +1689,68 @@ public class CoinCardPlugin extends JavaPlugin {
                 }
             }
             
-            if (System.currentTimeMillis() - lastCacheUpdate > 300000 || pageCache.isEmpty()) {
-                if (!isUpdating) {
-                    updateBaltopCache(sender, page);
-                } else {
-                    sender.sendMessage(YELLOW + "Balance top is being updated. Please wait...");
-                }
-            } else {
-                displayBaltop(sender, page);
+            // Always rebuild from current cache
+            rebuildPageCache();
+            
+            if (pageCache.isEmpty()) {
+                sender.sendMessage(RED + "No balance data available yet. Use /coin card to set your card first.");
+                return true;
             }
             
+            displayBaltop(sender, page);
             return true;
         }
         
-        private void updateBaltopCache(CommandSender requester, int requestedPage) {
+        private void rebuildPageCache() {
             synchronized (updateLock) {
-                if (isUpdating) return;
-                isUpdating = true;
+                if (isUpdating.get()) return;
+                isUpdating.set(true);
             }
-            
-            requester.sendMessage(YELLOW + "Loading balances from cache...");
             
             plugin.getAsyncExecutor().submit(() -> {
-                Set<UUID> allUsers = users.getAllUsers();
-                List<BalanceEntry> entries = Collections.synchronizedList(new ArrayList<>());
-                
-                for (UUID uuid : allUsers) {
-                    String card = users.getCard(uuid);
-                    String name = users.getNick(uuid);
-                    if (card != null && !card.isEmpty() && name != null && !name.isEmpty()) {
-                        Double balance = cache.getBalance(card);
-                        if (balance != null) {
-                            entries.add(new BalanceEntry(name, BigDecimal.valueOf(balance), card));
+                try {
+                    Set<UUID> allUsers = users.getAllUsers();
+                    List<BalanceEntry> entries = new ArrayList<>();
+                    
+                    for (UUID uuid : allUsers) {
+                        String card = users.getCard(uuid);
+                        String name = users.getNick(uuid);
+                        if (card != null && !card.isEmpty() && name != null && !name.isEmpty()) {
+                            Double balance = cache.getBalance(card);
+                            if (balance != null) {
+                                entries.add(new BalanceEntry(name, BigDecimal.valueOf(balance), card));
+                            }
                         }
                     }
+                    
+                    Collections.sort(entries);
+                    
+                    BigDecimal total = BigDecimal.ZERO;
+                    for (BalanceEntry entry : entries) {
+                        total = total.add(entry.balance);
+                    }
+                    totalServerBalance = total;
+                    totalPlayers = entries.size();
+                    
+                    Map<Integer, List<BalanceEntry>> newCache = new ConcurrentHashMap<>();
+                    int page = 1;
+                    List<BalanceEntry> currentPage = new ArrayList<>();
+                    
+                    for (int i = 0; i < entries.size(); i++) {
+                        currentPage.add(entries.get(i));
+                        if (currentPage.size() == 10 || i == entries.size() - 1) {
+                            newCache.put(page++, new ArrayList<>(currentPage));
+                            currentPage.clear();
+                        }
+                    }
+                    
+                    pageCache.clear();
+                    pageCache.putAll(newCache);
+                    lastCacheUpdate = System.currentTimeMillis();
+                } finally {
+                    isUpdating.set(false);
                 }
-                
-                finishUpdate(entries, requestedPage, requester);
             });
-        }
-        
-        private void finishUpdate(List<BalanceEntry> entries, int requestedPage, CommandSender requester) {
-            Collections.sort(entries);
-            
-            BigDecimal total = BigDecimal.ZERO;
-            for (BalanceEntry entry : entries) {
-                total = total.add(entry.balance);
-            }
-            totalServerBalance = total;
-            
-            pageCache.clear();
-            int page = 1;
-            List<BalanceEntry> currentPage = new ArrayList<>();
-            
-            for (int i = 0; i < entries.size(); i++) {
-                currentPage.add(entries.get(i));
-                if (currentPage.size() == 10 || i == entries.size() - 1) {
-                    pageCache.put(page++, new ArrayList<>(currentPage));
-                    currentPage.clear();
-                }
-            }
-            
-            totalPlayers = entries.size();
-            lastCacheUpdate = System.currentTimeMillis();
-            isUpdating = false;
-            
-            Bukkit.getScheduler().runTask(plugin, () -> displayBaltop(requester, requestedPage));
         }
         
         private void displayBaltop(CommandSender sender, int page) {
@@ -1684,14 +1781,25 @@ public class CoinCardPlugin extends JavaPlugin {
             }
             
             sender.sendMessage("");
-            sender.sendMessage(GRAY + "Your position: " + findPlayerPosition(sender));
+            
+            // Simple text navigation instructions (removed clickable components for compatibility)
+            if (page > 1) {
+                sender.sendMessage(YELLOW + "Type /baltop " + (page - 1) + " to go to previous page.");
+            }
+            if (page < pageCache.size()) {
+                sender.sendMessage(YELLOW + "Type /baltop " + (page + 1) + " to go to next page.");
+            }
             sender.sendMessage(GRAY + "Use " + YELLOW + "/baltop <page>" + GRAY + " to view other pages");
+            
+            if (sender instanceof Player) {
+                String position = findPlayerPosition((Player) sender);
+                if (position != null) {
+                    sender.sendMessage(GRAY + "Your position: " + YELLOW + position);
+                }
+            }
         }
         
-        private String findPlayerPosition(CommandSender sender) {
-            if (!(sender instanceof Player)) return "N/A";
-            
-            Player player = (Player) sender;
+        private String findPlayerPosition(Player player) {
             String playerCard = users.getCard(player.getUniqueId());
             if (playerCard == null) return "No card set";
             
@@ -1709,6 +1817,18 @@ public class CoinCardPlugin extends JavaPlugin {
             
             return "Not in top " + totalPlayers;
         }
+        
+        @Override
+        public List<String> onTabComplete(CommandSender sender, Command command, String alias, String[] args) {
+            if (args.length == 1) {
+                List<String> pages = new ArrayList<>();
+                for (int i = 1; i <= pageCache.size(); i++) {
+                    pages.add(String.valueOf(i));
+                }
+                return pages;
+            }
+            return Collections.emptyList();
+        }
     }
     
     public static class CoinCommand implements CommandExecutor, TabCompleter {
@@ -1716,8 +1836,7 @@ public class CoinCardPlugin extends JavaPlugin {
         private final UserStore users;
         private Economy eco;
         private ApiClient api;
-        private QueueService queue;
-        private CooldownManager cooldowns;
+        private AsyncQueueProcessor queue;
         private ConfigManager cfg;
         private BalanceCacheManager cache;
         
@@ -1729,21 +1848,18 @@ public class CoinCardPlugin extends JavaPlugin {
         private static final String WHITE = ChatColor.WHITE.toString();
     
         public CoinCommand(CoinCardPlugin plugin, UserStore users, ApiClient api,
-                          QueueService queue, CooldownManager cooldowns,
-                          Economy eco, ConfigManager cfg, BalanceCacheManager cache) {
+                          AsyncQueueProcessor queue, Economy eco, ConfigManager cfg, BalanceCacheManager cache) {
             this.plugin = plugin;
             this.users = users;
             this.api = api;
             this.queue = queue;
-            this.cooldowns = cooldowns;
             this.eco = eco;
             this.cfg = cfg;
             this.cache = cache;
         }
     
         public void setApi(ApiClient api) { this.api = api; }
-        public void setQueue(QueueService queue) { this.queue = queue; }
-        public void setCooldowns(CooldownManager cooldowns) { this.cooldowns = cooldowns; }
+        public void setQueue(AsyncQueueProcessor queue) { this.queue = queue; }
         public void setConfig(ConfigManager cfg) { this.cfg = cfg; }
         
         private String getCardByNick(String nick) {
@@ -1896,11 +2012,6 @@ public class CoinCardPlugin extends JavaPlugin {
         }
     
         private void payPlayer(Player p, String targetName, String amountStr) {
-            if (!cooldowns.checkAndStamp(p.getUniqueId())) {
-                p.sendMessage(RED + "Please wait 1 second before next transaction.");
-                return;
-            }
-    
             String fromCard = users.getCard(p.getUniqueId());
             if (fromCard == null || fromCard.isEmpty()) { 
                 p.sendMessage(RED + "Set your Card first with " + YELLOW + "/coin card <card>" + RED + "."); 
@@ -1930,14 +2041,12 @@ public class CoinCardPlugin extends JavaPlugin {
             final String fToCard = toCard;
             final String fTargetName = targetName;
     
-            plugin.getAsyncExecutor().submit(() -> {
+            queue.enqueue(() -> {
                 ApiClient.CardTransferResult r = api.transferByCard(fFromCard, fToCard, fAmount);
                 
                 Bukkit.getScheduler().runTask(plugin, () -> {
                     if (r.success) {
-                        cache.setBalance(fFromCard, cache.getBalanceOrDefault(fFromCard, 0) - fAmount);
-                        cache.setBalance(fToCard, cache.getBalanceOrDefault(fToCard, 0) + fAmount);
-                        
+                        // Do NOT update cache here
                         p.sendMessage(GREEN + "You sent " + YELLOW + DecimalUtil.formatFull(fAmount) + 
                                      GREEN + " to " + YELLOW + fTargetName + GREEN + 
                                      ". Transaction: " + AQUA + (r.txId != null ? r.txId : "-"));
@@ -1959,11 +2068,6 @@ public class CoinCardPlugin extends JavaPlugin {
         }
     
         private void buyCoinsToVault(Player p, String coinsStr) {
-            if (!cooldowns.checkAndStamp(p.getUniqueId())) {
-                p.sendMessage(RED + "Please wait 1 second before next transaction.");
-                return;
-            }
-    
             String fromCard = users.getCard(p.getUniqueId());
             String serverCard = cfg.getServerCard();
             
@@ -2006,38 +2110,30 @@ public class CoinCardPlugin extends JavaPlugin {
             final String fServerCard = serverCard;
     
             queue.enqueue(() -> {
-                plugin.getAsyncExecutor().submit(() -> {
-                    ApiClient.CardTransferResult r = api.transferByCard(fFromCard, fServerCard, fCoins);
+                ApiClient.CardTransferResult r = api.transferByCard(fFromCard, fServerCard, fCoins);
+                
+                Bukkit.getScheduler().runTask(plugin, () -> {
+                    if (!r.success) {
+                        p.sendMessage(RED + "Failed: Invalid card or insufficient coin balance.");
+                        return;
+                    }
+    
+                    eco.withdrawPlayer(serverAcc, fVaultToPay);
+                    eco.depositPlayer(p, fVaultToPay);
                     
-                    Bukkit.getScheduler().runTask(plugin, () -> {
-                        if (!r.success) {
-                            p.sendMessage(RED + "Failed: Invalid card or insufficient coin balance.");
-                            return;
-                        }
+                    // Do NOT update cache here
     
-                        eco.withdrawPlayer(serverAcc, fVaultToPay);
-                        eco.depositPlayer(p, fVaultToPay);
-                        
-                        cache.setBalance(fFromCard, cache.getBalanceOrDefault(fFromCard, 0) - fCoins);
-                        cache.setBalance(fServerCard, cache.getBalanceOrDefault(fServerCard, 0) + fCoins);
-    
-                        String tx = (r.txId != null ? r.txId : "-");
-                        p.sendMessage(GREEN + "Bought " + YELLOW + DecimalUtil.formatFull(fCoins) + 
-                                     GREEN + " coins for " + YELLOW + DecimalUtil.formatFull(fVaultToPay) + 
-                                     GREEN + " vault. Transaction: " + AQUA + tx);
-                        plugin.getLogger().info("BUY " + p.getName() + " coins=" + fCoins + 
-                                               " vault=" + fVaultToPay + " tx=" + tx);
-                    });
+                    String tx = (r.txId != null ? r.txId : "-");
+                    p.sendMessage(GREEN + "Bought " + YELLOW + DecimalUtil.formatFull(fCoins) + 
+                                 GREEN + " coins for " + YELLOW + DecimalUtil.formatFull(fVaultToPay) + 
+                                 GREEN + " vault. Transaction: " + AQUA + tx);
+                    plugin.getLogger().info("BUY " + p.getName() + " coins=" + fCoins + 
+                                           " vault=" + fVaultToPay + " tx=" + tx);
                 });
             });
         }
     
         private void sellVaultToCoins(Player p, String vaultStr) {
-            if (!cooldowns.checkAndStamp(p.getUniqueId())) {
-                p.sendMessage(RED + "Please wait 1 second before next transaction.");
-                return;
-            }
-    
             String toCard = users.getCard(p.getUniqueId());
             String serverCard = cfg.getServerCard();
             
@@ -2073,35 +2169,32 @@ public class CoinCardPlugin extends JavaPlugin {
             final String fServerCard = serverCard;
     
             queue.enqueue(() -> {
-                plugin.getAsyncExecutor().submit(() -> {
-                    ApiClient.CardTransferResult r = api.transferByCard(fServerCard, fToCard, fCoins);
+                ApiClient.CardTransferResult r = api.transferByCard(fServerCard, fToCard, fCoins);
+                
+                Bukkit.getScheduler().runTask(plugin, () -> {
+                    if (!r.success) {
+                        p.sendMessage(RED + "Failed: Server card invalid or insufficient funds.");
+                        return;
+                    }
+    
+                    eco.withdrawPlayer(p, fVault);
+                    OfflinePlayer serverAcc = plugin.getServerVaultAccount();
+                    if (serverAcc != null) eco.depositPlayer(serverAcc, fVault);
                     
-                    Bukkit.getScheduler().runTask(plugin, () -> {
-                        if (!r.success) {
-                            p.sendMessage(RED + "Failed: Server card invalid or insufficient funds.");
-                            return;
-                        }
+                    // Do NOT update cache here
     
-                        eco.withdrawPlayer(p, fVault);
-                        OfflinePlayer serverAcc = plugin.getServerVaultAccount();
-                        if (serverAcc != null) eco.depositPlayer(serverAcc, fVault);
-                        
-                        cache.setBalance(fServerCard, cache.getBalanceOrDefault(fServerCard, 0) - fCoins);
-                        cache.setBalance(fToCard, cache.getBalanceOrDefault(fToCard, 0) + fCoins);
-    
-                        String tx = (r.txId != null ? r.txId : "-");
-                        p.sendMessage(GREEN + "Sold " + YELLOW + DecimalUtil.formatFull(fVault) + 
-                                     GREEN + " vault for " + YELLOW + DecimalUtil.formatFull(fCoins) + 
-                                     GREEN + " coins. Transaction: " + AQUA + tx);
-                        
-                        if (p.isOnline()) {
-                            p.sendMessage(GREEN + "You received " + YELLOW + DecimalUtil.formatFull(fCoins) + 
-                                         GREEN + " coins from server. Transaction: " + AQUA + tx);
-                        }
-                        
-                        plugin.getLogger().info("SELL " + p.getName() + " vault=" + fVault + 
-                                               " coins=" + fCoins + " tx=" + tx);
-                    });
+                    String tx = (r.txId != null ? r.txId : "-");
+                    p.sendMessage(GREEN + "Sold " + YELLOW + DecimalUtil.formatFull(fVault) + 
+                                 GREEN + " vault for " + YELLOW + DecimalUtil.formatFull(fCoins) + 
+                                 GREEN + " coins. Transaction: " + AQUA + tx);
+                    
+                    if (p.isOnline()) {
+                        p.sendMessage(GREEN + "You received " + YELLOW + DecimalUtil.formatFull(fCoins) + 
+                                     GREEN + " coins from server. Transaction: " + AQUA + tx);
+                    }
+                    
+                    plugin.getLogger().info("SELL " + p.getName() + " vault=" + fVault + 
+                                           " coins=" + fCoins + " tx=" + tx);
                 });
             });
         }
@@ -2137,31 +2230,27 @@ public class CoinCardPlugin extends JavaPlugin {
             final String fTargetName = targetName;
     
             queue.enqueue(() -> {
-                plugin.getAsyncExecutor().submit(() -> {
-                    ApiClient.CardTransferResult r = api.transferByCard(fServerCard, fToCard, fAmount);
-                    
-                    Bukkit.getScheduler().runTask(plugin, () -> {
-                        if (r.success) {
-                            cache.setBalance(fServerCard, cache.getBalanceOrDefault(fServerCard, 0) - fAmount);
-                            cache.setBalance(fToCard, cache.getBalanceOrDefault(fToCard, 0) + fAmount);
-                            
-                            String tx = (r.txId != null ? r.txId : "-");
-                            s.sendMessage(GREEN + "Server sent " + YELLOW + DecimalUtil.formatFull(fAmount) + 
-                                         GREEN + " to " + YELLOW + fTargetName + GREEN + 
-                                         ". Transaction: " + AQUA + tx);
-                            
-                            Player onlineTarget = Bukkit.getPlayerExact(fTargetName);
-                            if (onlineTarget != null && onlineTarget.isOnline()) {
-                                onlineTarget.sendMessage(GREEN + "You received " + YELLOW + DecimalUtil.formatFull(fAmount) + 
-                                                        GREEN + " coins from server. Transaction: " + AQUA + tx);
-                            }
-                            
-                            plugin.getLogger().info("SERVER PAY to " + fTargetName + 
-                                                   " (offline=" + (onlineTarget == null) + ") amount=" + fAmount + " tx=" + tx);
-                        } else {
-                            s.sendMessage(RED + "Failed: Server card invalid or insufficient funds.");
+                ApiClient.CardTransferResult r = api.transferByCard(fServerCard, fToCard, fAmount);
+                
+                Bukkit.getScheduler().runTask(plugin, () -> {
+                    if (r.success) {
+                        // Do NOT update cache here
+                        String tx = (r.txId != null ? r.txId : "-");
+                        s.sendMessage(GREEN + "Server sent " + YELLOW + DecimalUtil.formatFull(fAmount) + 
+                                     GREEN + " to " + YELLOW + fTargetName + GREEN + 
+                                     ". Transaction: " + AQUA + tx);
+                        
+                        Player onlineTarget = Bukkit.getPlayerExact(fTargetName);
+                        if (onlineTarget != null && onlineTarget.isOnline()) {
+                            onlineTarget.sendMessage(GREEN + "You received " + YELLOW + DecimalUtil.formatFull(fAmount) + 
+                                                    GREEN + " coins from server. Transaction: " + AQUA + tx);
                         }
-                    });
+                        
+                        plugin.getLogger().info("SERVER PAY to " + fTargetName + 
+                                               " (offline=" + (onlineTarget == null) + ") amount=" + fAmount + " tx=" + tx);
+                    } else {
+                        s.sendMessage(RED + "Failed: Server card invalid or insufficient funds.");
+                    }
                 });
             });
         }
@@ -2180,7 +2269,7 @@ public class CoinCardPlugin extends JavaPlugin {
             }
             
             if (a.length == 2) {
-                if (a[0].equalsIgnoreCase("pay") || a[0].equalsIgnoreCase("server") && a.length == 2) {
+                if (a[0].equalsIgnoreCase("pay") || (a[0].equalsIgnoreCase("server") && a.length == 2)) {
                     out.addAll(Bukkit.getOnlinePlayers().stream()
                                      .map(Player::getName)
                                      .collect(Collectors.toList()));
