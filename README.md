@@ -27,3 +27,21 @@ Commands:
 
 It has the card payment and user coins management exported to API.
 It means that some other coin plugins now depends on this plugin.
+
+Config:
+  ```
+   # Coin economy config
+Main: false     # If true, this plugin will be the main Server economy manager and will control other vault based economy plugins.
+
+Server: "5e8127e5-646b-36d6-9ff7-ace1050597d8"     # Server Vault Account UUID
+Card: "e1301fadfc35"                               # Server Card ID
+Buy: 1.00                                       # Vault received for each 1.00000000 coin (coins->vault)
+Sell: 0.00000100                                   # Coins received for each 1.00 vault (vault->coins)
+API: "https://bank.foxsrv.net"  # The API URL - You can host your own using https://github.com/FoxUshiha/DC-Coin-Bot
+# General
+Decimals: 2                  # Coin Decimals between 0 and 8, constrols things like 8= 0.00000001 and 0= 1 (changes the number lenght)
+QueueIntervalTicks: 20       # process 1 task / 20 ticks (~1s)
+PerUserCooldownMs: 1100      # cooldown de /coin pay, /coin buy, /coin sell
+TimeoutMs: 60000             # timeout HTTP `
+
+  ```
