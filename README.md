@@ -4,7 +4,9 @@ Minecraft plugin for using coin cards to buy and sell coins for vault cash.
 Depends on Vault and an econnomy plugin.
 
 - Coin Project: https://github.com/FoxUshiha/DC-Coin-Bot
-- Coin API: http://coin.foxsrv.net:26450/
+- Discord Bot: https://discord.com/oauth2/authorize?client_id=1391067775077978214
+- Tutorial: https://youtu.be/QY1CqjTONwE
+- Coin API and Site: https://bank.foxsrv.net/
 (You can host your own)
 
 # Made for Minecraft 1.20+ Servers.
