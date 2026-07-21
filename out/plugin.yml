@@ -1,11 +1,13 @@
 name: CoinCard
-version: 2.1
+version: 3.0
 main: com.foxsrv.coincard.CoinCardPlugin
 api-version: "1.20"
+folia-supported: true
 depend: [Vault]
 softdepend: [PlaceholderAPI]
 author: FoxSRV
 description: Advanced card-based coin transaction system with encryption
+website: https://bank.foxsrv.net
 
 commands:
   coin:
@@ -20,25 +22,39 @@ commands:
       /coin balance [player] - Check balance (alias)
       /coin bal [player] - Check balance (alias)
       /coin baltop [page] - View top balances (alias)
+      /coin history [page] - View transaction history
       /coin reload - Reload configuration (admin)
       /coin server pay <player> <amount> - Pay using server card (admin)
     permission: coin.use
-  
+
   pay:
     description: Pay another player using your card
+    aliases: [pagar, transferir]
     usage: /pay <player> <amount>
     permission: coin.pay
-  
+
   balance:
     description: Check your or another player's balance
-    aliases: [bal]
+    aliases: [bal, money, funds, saldo]
     usage: /balance [player]
     permission: coin.balance
-  
+
   baltop:
     description: View top balances with pagination
+    aliases: [moneytop, topmoney, top, ranking]
     usage: /baltop [page]
     permission: coin.baltop
+
+  history:
+    description: View your transaction history
+    aliases: [historico, logs, transacoes]
+    usage: /history [page]
+    permission: coin.history
+
+  cardgen:
+    description: Manage card generation
+    permission: cardgen.admin
+    usage: /cardgen <reload|generate|list>
 
 permissions:
   coin.*:
@@ -50,23 +66,32 @@ permissions:
       coin.pay: true
       coin.balance: true
       coin.baltop: true
-  
+      coin.history: true
+
   coin.use:
     description: Use basic CoinCard commands
     default: true
-  
+
   coin.admin:
     description: Administrative commands (reload, server pay)
     default: op
-  
+
   coin.pay:
-    description: Use /pay command
+    description: Use /pay command (and its aliases)
     default: true
-  
+
   coin.balance:
-    description: Use /balance and /bal commands
+    description: Use /balance and its aliases (/bal, /money, etc.)
     default: true
-  
+
   coin.baltop:
-    description: Use /baltop command
+    description: Use /baltop and its aliases (/moneytop, /topmoney, etc.)
     default: true
+
+  coin.history:
+    description: Use /history and its aliases (/historico, /logs, etc.)
+    default: true
+
+  cardgen.admin:
+    description: Use cardgen commands.
+    default: false

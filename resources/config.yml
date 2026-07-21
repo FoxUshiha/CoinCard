@@ -9,5 +9,11 @@ API: "https://bank.foxsrv.net"    # The API URL - You can host your own using ht
 # General
 Decimals: 2                  # Coin Decimals between 0 and 8, constrols things like 8= 0.00000001 and 0= 1 (changes the number lenght)
 QueueIntervalTicks: 20       # process 1 task / 20 ticks (~1s)
-PerUserCooldownMs: 1000      # cooldown de /coin pay, /coin buy, /coin sell
-TimeoutMs: 10000             # timeout HTTP
+PerUserCooldownMs: 1100      # cooldown de /coin pay, /coin buy, /coin sell
+TimeoutMs: 60000             # timeout HTTP
+
+# Default Credentials for card generating
+
+DefaultPassword: 1234
+DefaultCooldown: 1010
+DefaultNameSpace: 002
