@@ -6,6 +6,7 @@ Depends on Vault and an econnomy plugin.
 - Coin Project: https://github.com/FoxUshiha/DC-Coin-Bot
 - Discord Bot: https://discord.com/oauth2/authorize?client_id=1391067775077978214
 - Tutorial: https://youtu.be/QY1CqjTONwE
+- To use on Folia: https://www.zrips.net/cmivault/
 - Coin API and Site: https://bank.foxsrv.net/
 (You can host your own)
 
