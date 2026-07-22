@@ -49,10 +49,14 @@ public class MainEconomy implements Economy {
         return plugin.isEnabled();
     }
 
-    @Override
-    public String getName() {
+@Override
+public String getName() {
+    // Fallback seguro caso o disguise ainda não tenha sido inicializado
+    if (plugin.getDisguise() == null) {
         return "CoinCard";
     }
+    return plugin.getDisguise().getEconomyName();
+}
 
     @Override
     public boolean hasBankSupport() {

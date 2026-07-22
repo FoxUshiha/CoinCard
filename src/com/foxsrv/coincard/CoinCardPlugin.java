@@ -52,8 +52,12 @@ import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
  * 
  * When Main: true, uses MainEconomy (synchronous, locks, busy state) to prevent double-spend.
  * When Main: false, uses CoinEconomy (asynchronous, queue-based) or an external Vault economy.
+ * 
+ * Disguise: when enabled along with Main: true, the plugin registers itself as "CMI" on Vault,
+ * allowing plugins that require a specific economy name (e.g., EconomyShopGUI+) to work.
  */
 public class CoinCardPlugin extends JavaPlugin {
+    private Disguise disguise = new Disguise(false); // nunca null
     private static CoinCardPlugin instance;
     private static CoinCardAPI api;
 
@@ -117,29 +121,58 @@ public class CoinCardPlugin extends JavaPlugin {
     public static CoinCardPlugin get() { return instance; }
     public static CoinCardAPI getAPI() { return api; }
 
-    // ==================== ON LOAD (EARLY REGISTRATION) ====================
-    @Override
-    public void onLoad() {
-        instance = this;
-        File configFile = new File(getDataFolder(), "config.yml");
-        if (configFile.exists()) {
-            org.bukkit.configuration.file.FileConfiguration cfg = getConfig();
-            if (cfg.getBoolean("Main", false)) {
-                // Main: true → use MainEconomy (synchronous, safe)
-                MainEconomy mainEconomy = new MainEconomy(this);
-                getServer().getServicesManager().register(Economy.class, mainEconomy, this, ServicePriority.Highest);
-                this.economy = mainEconomy;
-                getLogger().info("MainEconomy registered during onLoad (priority Highest).");
-            } else {
-                // Main: false → use CoinEconomy (async, queue-based)
-                CoinEconomy coinEconomy = new CoinEconomy(this);
-                getServer().getServicesManager().register(Economy.class, coinEconomy, this, ServicePriority.Highest);
-                this.economy = coinEconomy;
-                getLogger().info("CoinEconomy registered during onLoad (priority Highest).");
-            }
+    /**
+     * Disguise helper class.
+     * When enabled, the economy will report its name as "CMI" instead of "CoinCard".
+     * Only effective when Main: true.
+     */
+    public static class Disguise {
+        private final boolean enabled;
+
+        public Disguise(boolean enabled) {
+            this.enabled = enabled;
+        }
+
+        public boolean isEnabled() {
+            return enabled;
+        }
+
+        public String getEconomyName() {
+            return enabled ? "CMI" : "CoinCard";
         }
     }
 
+    // ==================== ON LOAD (EARLY REGISTRATION) ====================
+@Override
+public void onLoad() {
+    instance = this;
+    File configFile = new File(getDataFolder(), "config.yml");
+    if (configFile.exists()) {
+        org.bukkit.configuration.file.FileConfiguration cfg = getConfig();
+        // Inicializa config ANTES de registrar a economia
+        this.config = new ConfigManager(cfg);
+        boolean main = cfg.getBoolean("Main", false);
+        boolean disguise = cfg.getBoolean("Disguise", false);
+        this.disguise = new Disguise(disguise && main);
+        
+        if (main) {
+            MainEconomy mainEconomy = new MainEconomy(this);
+            getServer().getServicesManager().register(Economy.class, mainEconomy, this, ServicePriority.Highest);
+            this.economy = mainEconomy;
+            getLogger().info("MainEconomy registered during onLoad (priority Highest).");
+        } else {
+            CoinEconomy coinEconomy = new CoinEconomy(this);
+            getServer().getServicesManager().register(Economy.class, coinEconomy, this, ServicePriority.Highest);
+            this.economy = coinEconomy;
+            getLogger().info("CoinEconomy registered during onLoad (priority Highest).");
+        }
+    } else {
+        // Fallback (config padrão) para evitar NPE
+        this.config = new ConfigManager(new org.bukkit.configuration.file.YamlConfiguration());
+        this.disguise = new Disguise(false);
+    }
+}
+    
     @Override
     public void onEnable() {
         instance = this;
@@ -159,6 +192,9 @@ public class CoinCardPlugin extends JavaPlugin {
 
         reloadLocalConfig();
         DecimalUtil.setDisplayDecimals(config.getDecimals());
+
+        // Initialize disguise (only meaningful when Main: true)
+        this.disguise = new Disguise(config.isDisguise() && config.isMainEconomy());
 
         if (!isVaultPresent()) {
             getLogger().severe("Vault plugin not found. Disabling plugin.");
@@ -180,7 +216,7 @@ public class CoinCardPlugin extends JavaPlugin {
         } else {
             // Use existing Vault economy if available, otherwise fallback to CoinEconomy
             Economy existing = getVaultEconomy();
-            if (existing != null && !existing.getName().equals("CoinCard")) {
+            if (existing != null && !existing.getName().equals("CoinCard") && !existing.getName().equals("CMI")) {
                 // Use the existing economy (external)
                 this.economy = existing;
                 getLogger().info("Using existing Vault economy: " + existing.getName());
@@ -275,7 +311,8 @@ public class CoinCardPlugin extends JavaPlugin {
 
         getLogger().info("CoinCard v" + getDescription().getVersion() + " enabled (Folia).");
         String mode = config.isMainEconomy() ? "Main (sync)" : "Standalone/Async";
-        getLogger().info("Mode: " + mode + " – Economy: " + economy.getName());
+        String displayedName = disguise.getEconomyName();
+        getLogger().info("Mode: " + mode + " – Economy name: " + displayedName + (disguise.isEnabled() ? " (DISGUISED as CMI)" : ""));
         getLogger().info("Commands: /coin, /c, /pay, /balance, /bal, /baltop, /history, /cardgen");
         getLogger().info("Fully asynchronous and optimized.");
         getLogger().info("Decimals config = " + config.getDecimals() + " (API remains 8 decimals internal)");
@@ -283,6 +320,7 @@ public class CoinCardPlugin extends JavaPlugin {
 
     /**
      * Forces Vault to use our registered economy (either MainEconomy or CoinEconomy).
+     * Now uses instance comparison to avoid issues with disguised names.
      */
     private void forceVaultEconomy(Economy ourEconomy) {
         getServer().getGlobalRegionScheduler().runDelayed(this, task -> {
@@ -292,19 +330,20 @@ public class CoinCardPlugin extends JavaPlugin {
                 getServer().getServicesManager().register(Economy.class, ourEconomy, this, ServicePriority.Highest);
                 return;
             }
-            if (!current.getName().equals("CoinCard")) {
-                getLogger().warning("Vault is using " + current.getName() + " instead of CoinCard. Attempting to replace...");
+            // Compare by reference, not by name, to support disguise.
+            if (current != ourEconomy) {
+                getLogger().warning("Vault is using " + current.getName() + " instead of " + ourEconomy.getName() + ". Attempting to replace...");
                 getServer().getServicesManager().unregister(Economy.class, current);
                 getServer().getServicesManager().register(Economy.class, ourEconomy, this, ServicePriority.Highest);
                 Economy newCurrent = getVaultEconomy();
-                if (newCurrent != null && newCurrent.getName().equals("CoinCard")) {
-                    getLogger().info("Successfully switched Vault to CoinCard.");
+                if (newCurrent == ourEconomy) {
+                    getLogger().info("Successfully switched Vault to " + ourEconomy.getName() + ".");
                 } else {
-                    getLogger().severe("Failed to switch Vault to CoinCard. Another economy plugin is overriding it. " +
+                    getLogger().severe("Failed to switch Vault to " + ourEconomy.getName() + ". Another economy plugin is overriding it. " +
                             "Consider disabling other economy plugins or setting them to not register Vault.");
                 }
             } else {
-                getLogger().info("Vault is correctly using CoinCard.");
+                getLogger().info("Vault is correctly using " + ourEconomy.getName() + ".");
             }
         }, 20L);
     }
@@ -399,6 +438,10 @@ public class CoinCardPlugin extends JavaPlugin {
         reloadConfig();
         this.config = new ConfigManager(getConfig());
         DecimalUtil.setDisplayDecimals(config.getDecimals());
+        // Update disguise if config changed
+        if (this.disguise != null) {
+            this.disguise = new Disguise(config.isDisguise() && config.isMainEconomy());
+        }
     }
 
     public void applyRuntimeConfig() {
@@ -469,6 +512,7 @@ public class CoinCardPlugin extends JavaPlugin {
     public HistoryStore getHistoryStore() { return historyStore; }
     public ExecutorService getAsyncExecutor() { return asyncExecutor; }
     public PendingTransactionStore getPendingStore() { return pendingStore; }
+    public Disguise getDisguise() { return disguise; }
 
     public OfflinePlayer getServerVaultAccount() {
         try {
@@ -544,92 +588,100 @@ public class CoinCardPlugin extends JavaPlugin {
     }
 
     // Helper para notificar o MainEconomy (se estiver ativo)
-private void notifyMainEconomy(String txId, CoinCardPlugin.ApiClient.CardTransferResult result) {
-    if (economy instanceof MainEconomy) {
-        ((MainEconomy) economy).completeFuture(txId, result);
+    private void notifyMainEconomy(String txId, CoinCardPlugin.ApiClient.CardTransferResult result) {
+        if (economy instanceof MainEconomy) {
+            ((MainEconomy) economy).completeFuture(txId, result);
+        }
     }
-}
 
-void processWithdrawQueue(UUID uuid) {
-    queueProcessor.enqueue(() -> {
-        ReentrantLock lock = getPlayerLock(uuid);
-        if (!lock.tryLock()) {
-            queueProcessor.enqueue(() -> processWithdrawQueue(uuid));
-            return;
-        }
-        try {
-            Queue<VaultWithdrawTransaction> queue = pendingWithdraws.get(uuid);
-            if (queue == null || queue.isEmpty()) return;
-
-            VaultWithdrawTransaction tx = queue.peek();
-            if (tx == null) return;
-
-            // Tenta executar a transferência
-            ApiClient.CardTransferResult result = apiClient.transferByCard(tx.card, tx.serverCard, tx.internalAmount);
-
-            if (result.success) {
-                // Sucesso: remove da fila
-                queue.poll();
-                withdrawPendingCards.remove(tx.card);
-                // Sincroniza saldo com a API
-                ApiClient.CardInfoResult info = apiClient.getCardInfo(tx.card);
-                if (info.success && info.coins != null) {
-                    balanceCache.setBalance(tx.card, info.coins);
-                }
-                historyStore.addEntry(tx.playerUUID, "withdraw", tx.internalAmount,
-                        "Vault withdraw (queue)", tx.originalBalanceInternal - tx.internalAmount);
-                if (pendingStore != null) pendingStore.remove(tx.txId);
-                notifyMainEconomy(tx.txId, result);
-                processWithdrawQueue(uuid);
+    void processWithdrawQueue(UUID uuid) {
+        queueProcessor.enqueue(() -> {
+            ReentrantLock lock = getPlayerLock(uuid);
+            if (!lock.tryLock()) {
+                queueProcessor.enqueue(() -> processWithdrawQueue(uuid));
                 return;
             }
+            try {
+                Queue<VaultWithdrawTransaction> queue = pendingWithdraws.get(uuid);
+                if (queue == null || queue.isEmpty()) return;
 
-            // Falha: verifica se é por saldo insuficiente
-            String errorMsg = result.raw != null ? result.raw : "";
-            boolean insufficient = errorMsg.contains("INSUFFICIENT_FUNDS") || errorMsg.contains("insufficient");
+                VaultWithdrawTransaction tx = queue.peek();
+                if (tx == null) return;
 
-            if (insufficient) {
-                // Tenta transferir TODO o saldo restante do cartão para o servidor
-                ApiClient.CardInfoResult info = apiClient.getCardInfo(tx.card);
-                if (info.success && info.coins != null && info.coins > 0) {
-                    double remaining = info.coins;
-                    ApiClient.CardTransferResult forcedResult = apiClient.transferByCard(tx.card, tx.serverCard, remaining);
-                    if (forcedResult.success) {
-                        balanceCache.setBalance(tx.card, 0.0);
-                        historyStore.addEntry(tx.playerUUID, "forced_withdraw", remaining,
-                                "Forced transfer (remaining balance)", 0.0);
-                        getLogger().info("Forced transfer of " + remaining + " for " + tx.playerUUID +
-                                " due to insufficient funds for original amount " + tx.displayAmount);
+                int attempts = withdrawAttempts.getOrDefault(uuid, 0);
+                if (attempts >= MAX_RETRIES) {
+                    queue.poll();
+                    withdrawAttempts.remove(uuid);
+                    withdrawPendingCards.remove(tx.card);
+                    restoreBalanceAfterFailedWithdraw(uuid, tx);
+                    if (pendingStore != null) pendingStore.remove(tx.txId);
+                    notifyMainEconomy(tx.txId, new ApiClient.CardTransferResult(false, null, "MAX_RETRIES_EXCEEDED"));
+                    processWithdrawQueue(uuid);
+                    return;
+                }
+
+                ApiClient.CardTransferResult result = apiClient.transferByCard(tx.card, tx.serverCard, tx.internalAmount);
+
+                if (result.success) {
+                    queue.poll();
+                    withdrawAttempts.remove(uuid);
+                    // O saldo já foi subtraído no MainEconomy, NÃO subtraia novamente.
+                    withdrawPendingCards.remove(tx.card);
+                    historyStore.addEntry(tx.playerUUID, "withdraw", tx.internalAmount,
+                            "Vault withdraw (queue)", tx.originalBalanceInternal - tx.internalAmount);
+                    if (pendingStore != null) pendingStore.remove(tx.txId);
+                    notifyMainEconomy(tx.txId, result);
+                    processWithdrawQueue(uuid);
+                    return;
+                }
+
+                // Falha: verifica se é por saldo insuficiente
+                String errorMsg = result.raw != null ? result.raw : "";
+                boolean insufficient = errorMsg.contains("INSUFFICIENT_FUNDS") || errorMsg.contains("insufficient");
+
+                if (insufficient) {
+                    // Tenta transferir TODO o saldo restante do cartão para o servidor
+                    ApiClient.CardInfoResult info = apiClient.getCardInfo(tx.card);
+                    if (info.success && info.coins != null && info.coins > 0) {
+                        double remaining = info.coins;
+                        ApiClient.CardTransferResult forcedResult = apiClient.transferByCard(tx.card, tx.serverCard, remaining);
+                        if (forcedResult.success) {
+                            balanceCache.setBalance(tx.card, 0.0);
+                            historyStore.addEntry(tx.playerUUID, "forced_withdraw", remaining,
+                                    "Forced transfer (remaining balance)", 0.0);
+                            getLogger().info("Forced transfer of " + remaining + " for " + tx.playerUUID +
+                                    " due to insufficient funds for original amount " + tx.displayAmount);
+                        } else {
+                            getLogger().warning("Failed to force transfer remaining " + remaining +
+                                    " for " + tx.playerUUID + ": " + forcedResult.raw);
+                            // Se falhar, mantém na fila e tenta novamente
+                            queueProcessor.enqueue(() -> processWithdrawQueue(uuid));
+                            return;
+                        }
                     } else {
-                        getLogger().warning("Failed to force transfer remaining " + remaining +
-                                " for " + tx.playerUUID + ": " + forcedResult.raw);
-                        // Se falhar, mantém na fila e tenta novamente
-                        queueProcessor.enqueue(() -> processWithdrawQueue(uuid));
-                        return;
+                        getLogger().warning("No remaining balance for " + tx.playerUUID +
+                                " after insufficient funds. Removing transaction.");
                     }
-                } else {
-                    getLogger().warning("No remaining balance for " + tx.playerUUID +
-                            " after insufficient funds. Removing transaction.");
+                    // Remove a transação original (já foi tratada)
+                    queue.poll();
+                    withdrawPendingCards.remove(tx.card);
+                    if (pendingStore != null) pendingStore.remove(tx.txId);
+                    notifyMainEconomy(tx.txId, result);
+                    processWithdrawQueue(uuid);
+                    return;
                 }
-                // Remove a transação original (já foi tratada)
-                queue.poll();
-                withdrawPendingCards.remove(tx.card);
-                if (pendingStore != null) pendingStore.remove(tx.txId);
-                processWithdrawQueue(uuid);
-                return;
+
+                // Outros erros: mantém na fila e tenta novamente (retry infinito)
+                getLogger().warning("Withdraw failed for " + tx.playerUUID + " (" + tx.displayAmount +
+                        "): " + errorMsg + " - retrying...");
+                try { Thread.sleep(5000); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+                queueProcessor.enqueue(() -> processWithdrawQueue(uuid));
+
+            } finally {
+                lock.unlock();
             }
-
-            // Outros erros: mantém na fila e tenta novamente (retry infinito)
-            getLogger().warning("Withdraw failed for " + tx.playerUUID + " (" + tx.displayAmount +
-                    "): " + errorMsg + " - retrying...");
-            try { Thread.sleep(5000); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
-            queueProcessor.enqueue(() -> processWithdrawQueue(uuid));
-
-        } finally {
-            lock.unlock();
-        }
-    });
-}
+        });
+    }
 
     private void restoreBalanceAfterFailedWithdraw(UUID uuid, VaultWithdrawTransaction tx) {
         ApiClient.CardInfoResult result = apiClient.getCardInfo(tx.card);
@@ -642,48 +694,48 @@ void processWithdrawQueue(UUID uuid) {
                 " (" + tx.displayAmount + "). Balance restored.");
     }
 
-void processDepositQueue() {
-    queueProcessor.enqueue(() -> {
-        VaultDepositTransaction tx = pendingDeposits.poll();
-        if (tx == null) return;
+    void processDepositQueue() {
+        queueProcessor.enqueue(() -> {
+            VaultDepositTransaction tx = pendingDeposits.poll();
+            if (tx == null) return;
 
-        if (withdrawPendingCards.contains(tx.card)) {
-            pendingDeposits.offer(tx);
-            queueProcessor.enqueue(() -> processDepositQueue());
-            return;
-        }
-
-        ApiClient.CardTransferResult result = apiClient.transferByCard(tx.serverCard, tx.card, tx.internalAmount);
-
-        if (result.success) {
-            // O saldo já foi somado no MainEconomy, NÃO modifique o cache aqui.
-            // Apenas registra histórico e notifica.
-            historyStore.addEntry(tx.playerUUID, "deposit", tx.internalAmount,
-                    "Vault deposit (queue)", balanceCache.getBalanceFast(tx.card));
-            if (pendingStore != null) pendingStore.remove(tx.txId);
-            notifyMainEconomy(tx.txId, result);
-        } else {
-            tx.retryCount++;
-            if (tx.retryCount < MAX_RETRIES) {
+            if (withdrawPendingCards.contains(tx.card)) {
                 pendingDeposits.offer(tx);
-                if (pendingStore != null) pendingStore.updateAttempts(tx.txId, tx.retryCount);
-                getLogger().warning("Deposit failed (attempt " + tx.retryCount + ") for " + tx.playerUUID +
-                        " (" + tx.displayAmount + "). Re-queueing.");
-                processDepositQueue();
-            } else {
-                getLogger().severe("Deposit failed after " + MAX_RETRIES + " attempts for " + tx.playerUUID +
-                        " (" + tx.displayAmount + "). Transaction lost. Manual intervention required.");
-                // Rollback: subtrai o valor do cache
-                Double currentInternal = balanceCache.getLastBalance(tx.card);
-                if (currentInternal == null) currentInternal = 0.0;
-                double newInternal = Math.max(0.0, currentInternal - tx.internalAmount);
-                balanceCache.setBalance(tx.card, newInternal);
+                queueProcessor.enqueue(() -> processDepositQueue());
+                return;
+            }
+
+            ApiClient.CardTransferResult result = apiClient.transferByCard(tx.serverCard, tx.card, tx.internalAmount);
+
+            if (result.success) {
+                // O saldo já foi somado no MainEconomy, NÃO modifique o cache aqui.
+                // Apenas registra histórico e notifica.
+                historyStore.addEntry(tx.playerUUID, "deposit", tx.internalAmount,
+                        "Vault deposit (queue)", balanceCache.getBalanceFast(tx.card));
                 if (pendingStore != null) pendingStore.remove(tx.txId);
                 notifyMainEconomy(tx.txId, result);
+            } else {
+                tx.retryCount++;
+                if (tx.retryCount < MAX_RETRIES) {
+                    pendingDeposits.offer(tx);
+                    if (pendingStore != null) pendingStore.updateAttempts(tx.txId, tx.retryCount);
+                    getLogger().warning("Deposit failed (attempt " + tx.retryCount + ") for " + tx.playerUUID +
+                            " (" + tx.displayAmount + "). Re-queueing.");
+                    processDepositQueue();
+                } else {
+                    getLogger().severe("Deposit failed after " + MAX_RETRIES + " attempts for " + tx.playerUUID +
+                            " (" + tx.displayAmount + "). Transaction lost. Manual intervention required.");
+                    // Rollback: subtrai o valor do cache
+                    Double currentInternal = balanceCache.getLastBalance(tx.card);
+                    if (currentInternal == null) currentInternal = 0.0;
+                    double newInternal = Math.max(0.0, currentInternal - tx.internalAmount);
+                    balanceCache.setBalance(tx.card, newInternal);
+                    if (pendingStore != null) pendingStore.remove(tx.txId);
+                    notifyMainEconomy(tx.txId, result);
+                }
             }
-        }
-    });
-}
+        });
+    }
 
     // ==================== PENDING TRANSACTION STORE ====================
 
@@ -1064,7 +1116,7 @@ void processDepositQueue() {
         private final CoinCardPlugin plugin;
         private final Map<String, CachedBalance> cache = new ConcurrentHashMap<>();
         private final File cacheFile;
-        private final long CACHE_DURATION_MS = 30000;
+        private final long CACHE_DURATION_MS = 10000;
         private final Object saveLock = new Object();
         private volatile boolean dirty = false;
 
@@ -1079,7 +1131,7 @@ void processDepositQueue() {
             }
 
             boolean isValid(long currentTime) {
-                return (currentTime - timestamp) < 30000;
+                return (currentTime - timestamp) < 10000;
             }
         }
 
@@ -1285,8 +1337,8 @@ void processDepositQueue() {
         private Thread updaterThread;
         private final AtomicBoolean running = new AtomicBoolean(false);
         private final AtomicBoolean updating = new AtomicBoolean(false);
-        private final long REQUEST_DELAY_MS = 100;
-        private final long CYCLE_SLEEP_MS = 300000;
+        private final long REQUEST_DELAY_MS = 1000;
+        private final long CYCLE_SLEEP_MS = 600000;
 
         public BaltopUpdater(CoinCardPlugin plugin, UserStore users, ApiClient api, BalanceCacheManager cache) {
             this.plugin = plugin;
@@ -1371,6 +1423,7 @@ void processDepositQueue() {
 
     public static class ConfigManager {
         private final boolean mainEconomy;
+        private final boolean disguise;
         private final String serverVaultUUID;
         private final String serverCard;
         private final double buyVaultPerCoin;
@@ -1389,6 +1442,7 @@ void processDepositQueue() {
 
         public ConfigManager(org.bukkit.configuration.file.FileConfiguration c) {
             this.mainEconomy = c.getBoolean("Main", false);
+            this.disguise = c.getBoolean("Disguise", false);
             this.serverVaultUUID = c.getString("Server", "");
             this.serverCard = c.getString("Card", "");
             this.buyVaultPerCoin = c.getDouble("Buy", 1.0D);
@@ -1407,6 +1461,7 @@ void processDepositQueue() {
         }
 
         public boolean isMainEconomy() { return mainEconomy; }
+        public boolean isDisguise() { return disguise; }
         public String getServerVaultUUID() { return serverVaultUUID; }
         public String getServerCard() { return serverCard; }
         public double getBuyVaultPerCoin() { return buyVaultPerCoin; }
@@ -1985,7 +2040,7 @@ void processDepositQueue() {
         private BalanceCacheManager cache;
         private final Map<UUID, Double> balanceCache = new ConcurrentHashMap<>();
         private final Map<UUID, Long> lastUpdate = new ConcurrentHashMap<>();
-        private final long CACHE_TTL_MS = 30000;
+        private final long CACHE_TTL_MS = 3000;
         private ScheduledTask updateTask;
 
         public CoinPlaceholderExpansion(CoinCardPlugin plugin, ApiClient api, UserStore users, BalanceCacheManager cache) {
@@ -2001,7 +2056,7 @@ void processDepositQueue() {
                 for (Player player : Bukkit.getOnlinePlayers()) {
                     updateBalanceAsync(player.getUniqueId());
                 }
-            }, 100L, 100L);
+            }, 60L, 60L);
         }
 
         public void setApi(ApiClient api) { this.api = api; }
@@ -2108,7 +2163,10 @@ void processDepositQueue() {
 
         @Override
         public String getName() {
-            return "CoinCard";
+          if (plugin.getDisguise() == null) {
+          return "CoinCard"; // fallback seguro
+        }
+          return plugin.getDisguise().getEconomyName();
         }
 
         @Override
