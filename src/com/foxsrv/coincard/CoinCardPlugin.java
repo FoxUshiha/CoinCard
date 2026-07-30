@@ -75,6 +75,9 @@ public class CoinCardPlugin extends JavaPlugin {
     // Generator instance
     private CoinCardGenerator cardGenerator;
 
+    // AutoClaim instance
+    private AutoClaim autoClaim; // <-- NOVO
+
     // Command references
     private CoinCommand coinCommand;
     private PayCommand payCommand;
@@ -143,35 +146,35 @@ public class CoinCardPlugin extends JavaPlugin {
     }
 
     // ==================== ON LOAD (EARLY REGISTRATION) ====================
-@Override
-public void onLoad() {
-    instance = this;
-    File configFile = new File(getDataFolder(), "config.yml");
-    if (configFile.exists()) {
-        org.bukkit.configuration.file.FileConfiguration cfg = getConfig();
-        // Inicializa config ANTES de registrar a economia
-        this.config = new ConfigManager(cfg);
-        boolean main = cfg.getBoolean("Main", false);
-        boolean disguise = cfg.getBoolean("Disguise", false);
-        this.disguise = new Disguise(disguise && main);
-        
-        if (main) {
-            MainEconomy mainEconomy = new MainEconomy(this);
-            getServer().getServicesManager().register(Economy.class, mainEconomy, this, ServicePriority.Highest);
-            this.economy = mainEconomy;
-            getLogger().info("MainEconomy registered during onLoad (priority Highest).");
+    @Override
+    public void onLoad() {
+        instance = this;
+        File configFile = new File(getDataFolder(), "config.yml");
+        if (configFile.exists()) {
+            org.bukkit.configuration.file.FileConfiguration cfg = getConfig();
+            // Inicializa config ANTES de registrar a economia
+            this.config = new ConfigManager(cfg);
+            boolean main = cfg.getBoolean("Main", false);
+            boolean disguise = cfg.getBoolean("Disguise", false);
+            this.disguise = new Disguise(disguise && main);
+            
+            if (main) {
+                MainEconomy mainEconomy = new MainEconomy(this);
+                getServer().getServicesManager().register(Economy.class, mainEconomy, this, ServicePriority.Highest);
+                this.economy = mainEconomy;
+                getLogger().info("MainEconomy registered during onLoad (priority Highest).");
+            } else {
+                CoinEconomy coinEconomy = new CoinEconomy(this);
+                getServer().getServicesManager().register(Economy.class, coinEconomy, this, ServicePriority.Highest);
+                this.economy = coinEconomy;
+                getLogger().info("CoinEconomy registered during onLoad (priority Highest).");
+            }
         } else {
-            CoinEconomy coinEconomy = new CoinEconomy(this);
-            getServer().getServicesManager().register(Economy.class, coinEconomy, this, ServicePriority.Highest);
-            this.economy = coinEconomy;
-            getLogger().info("CoinEconomy registered during onLoad (priority Highest).");
+            // Fallback (config padrão) para evitar NPE
+            this.config = new ConfigManager(new org.bukkit.configuration.file.YamlConfiguration());
+            this.disguise = new Disguise(false);
         }
-    } else {
-        // Fallback (config padrão) para evitar NPE
-        this.config = new ConfigManager(new org.bukkit.configuration.file.YamlConfiguration());
-        this.disguise = new Disguise(false);
     }
-}
     
     @Override
     public void onEnable() {
@@ -309,6 +312,11 @@ public void onLoad() {
         cardGenerator.init();
         getLogger().info("CoinCardGenerator integrated and initialized.");
 
+        // ========== INICIAR AUTO CLAIM ==========
+        autoClaim = new AutoClaim(this);
+        autoClaim.start();
+        getLogger().info("AutoClaim integrated and initialized.");
+
         getLogger().info("CoinCard v" + getDescription().getVersion() + " enabled (Folia).");
         String mode = config.isMainEconomy() ? "Main (sync)" : "Standalone/Async";
         String displayedName = disguise.getEconomyName();
@@ -365,6 +373,9 @@ public void onLoad() {
     @Override
     public void onDisable() {
         if (cardGenerator != null) cardGenerator.shutdown();
+
+        // ========== PARAR AUTO CLAIM ==========
+        if (autoClaim != null) autoClaim.stop();
 
         if (asyncExecutor != null) {
             asyncExecutor.shutdown();
@@ -442,6 +453,13 @@ public void onLoad() {
         if (this.disguise != null) {
             this.disguise = new Disguise(config.isDisguise() && config.isMainEconomy());
         }
+        // Reiniciar AutoClaim com a nova configuração
+        if (autoClaim != null) {
+            autoClaim.stop();
+            autoClaim = new AutoClaim(this);
+            autoClaim.start();
+            getLogger().info("AutoClaim reloaded with new config.");
+        }
     }
 
     public void applyRuntimeConfig() {
@@ -487,6 +505,13 @@ public void onLoad() {
             baltopUpdater.updateComponents(users, apiClient);
         }
         DecimalUtil.setDisplayDecimals(config.getDecimals());
+
+        // Reiniciar AutoClaim com nova config (caso applyRuntimeConfig seja chamado)
+        if (autoClaim != null) {
+            autoClaim.stop();
+            autoClaim = new AutoClaim(this);
+            autoClaim.start();
+        }
     }
 
     private boolean isVaultPresent() {
@@ -1440,6 +1465,9 @@ public void onLoad() {
         private final int maxSuffixAttempts;
         private final long perUserCooldownMs;
 
+        // ===== AUTO CLAIM CONFIG =====
+        private final double claimTax;
+
         public ConfigManager(org.bukkit.configuration.file.FileConfiguration c) {
             this.mainEconomy = c.getBoolean("Main", false);
             this.disguise = c.getBoolean("Disguise", false);
@@ -1458,6 +1486,9 @@ public void onLoad() {
             this.defaultNameSpace = c.getInt("DefaultNameSpace", 2);
             this.maxSuffixAttempts = c.getInt("MaxSuffixAttempts", 10);
             this.perUserCooldownMs = c.getLong("PerUserCooldownMs", 1100L);
+
+            // Lê a taxa de claim do config
+            this.claimTax = c.getDouble("ClaimTax", 0.01);
         }
 
         public boolean isMainEconomy() { return mainEconomy; }
@@ -1477,6 +1508,9 @@ public void onLoad() {
         public int getDefaultNameSpace() { return defaultNameSpace; }
         public int getMaxSuffixAttempts() { return maxSuffixAttempts; }
         public long getPerUserCooldownMs() { return perUserCooldownMs; }
+
+        // ===== GETTER PARA ClaimTax =====
+        public double getClaimTax() { return claimTax; }
     }
 
     // ==================== USER STORE ====================
@@ -3094,6 +3128,12 @@ public void onLoad() {
                     if (!s.hasPermission("coin.admin")) { s.sendMessage(RED + "No permission."); return true; }
                     plugin.reloadLocalConfig();
                     plugin.applyRuntimeConfig();
+                    // Reiniciar AutoClaim manualmente (já feito dentro do reloadLocalConfig, mas por segurança)
+                    if (plugin.autoClaim != null) {
+                        plugin.autoClaim.stop();
+                        plugin.autoClaim = new AutoClaim(plugin);
+                        plugin.autoClaim.start();
+                    }
                     s.sendMessage(GREEN + "Configuration reloaded.");
                     return true;
 
